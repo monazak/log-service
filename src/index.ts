@@ -1,9 +1,11 @@
+import { loadConfig } from "./config/env.ts";
 import { buildServer } from "./http/server.ts";
 
+const config = loadConfig();
 const app = buildServer();
 
 try{
-    await app.listen({port: 8080, host: "0.0.0.0"});
+    await app.listen({port: config.port, host: config.host});
 }catch(error){
     app.log.error(error);
     process.exit(1);
