@@ -37,3 +37,24 @@ format the spec requires.
 
 Config loading and query parameter parsing run a few times per second, so they
 use Zod, where clarity is worth more than nanoseconds.
+
+## Project structure
+
+Three layers with dependencies pointing inward:
+
+- `http/` — Fastify routes, status codes, response shaping.
+- `domain/` — types and validation rules. No I/O, no framework imports.
+- `db/` — connection pool, repositories, SQL query construction.
+
+`domain/` imports from neither of the others. Test: if the HTTP layer were
+replaced by a CLI, `domain/` would not change.
+
+Rationale:
+
+1. Validation and query building are unit-testable as plain functions, with no
+   server or database required.
+2. All dynamic SQL construction is confined to `db/queries/`, giving a single
+   auditable location for injection safety — necessary since we rejected an ORM.
+3. The ingestion write path will be rewritten during performance work
+   (INSERT → batched COPY). Behind a repository boundary, that swap does not
+   touch HTTP handlers.
