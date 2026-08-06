@@ -1,0 +1,10 @@
+services:
+  app:
+    build:
+      target: builder
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      LOG_LEVEL: info
+    volumes:
+      - ./src:/app/src:ro
