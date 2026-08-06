@@ -18,5 +18,6 @@ export function buildServer(config: Config): FastifyInstance {
         }
         return reply.code(200).send({status: "ok"});
     });
+
     return app;
 }
