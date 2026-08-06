@@ -71,3 +71,25 @@ sustained load tests can produce gigabytes of container logs.
 
 LOG_LEVEL overrides the default in any environment, so verbose debugging remains
 available in a running container.
+
+## Resource limits and Node heap sizing
+
+Container limits match the spec: 0.5 CPU / 256 MB for the application,
+1 CPU / 1 GB for PostgreSQL. Applied from the start of the project so that every
+performance measurement is taken under the conditions the solution is graded in,
+rather than on full laptop resources.
+
+The application container sets `NODE_OPTIONS=--max-old-space-size=192`.
+
+Reason: Node does not read the container's cgroup limit. It inspects total host
+memory and sizes its heap accordingly. Inside a 256 MB container this means the
+garbage collector defers collection based on memory that does not exist, the
+process exceeds the limit, and the kernel OOM-kills it — no exception, no stack
+trace. The container simply disappears and `restart: unless-stopped` brings it
+back, so the failure presents as a random dropout under load.
+
+192 rather than 256 because Node's off-heap usage (buffers, native modules,
+thread stacks) falls outside this limit. The remaining 64 MB is headroom.
+
+Expected trade-off: the GC runs more often under ingestion pressure. This is
+deliberate — predictable short pauses beat sudden process death.

@@ -17,6 +17,11 @@ services:
       retries: 10
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
 
   app:
     build: .
@@ -25,11 +30,18 @@ services:
     environment:
       NODE_ENV: production
       DATABASE_URL: postgres://logservice:logservice@postgres:5432/logs
+      NODE_OPTIONS: "--max-old-space-size=192"
+
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
 volumes:
   postgres-data:
