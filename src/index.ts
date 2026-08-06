@@ -3,7 +3,7 @@ import { buildServer } from "./http/server.ts";
 import { markReady } from "./http/readiness.ts";
 
 const config = loadConfig();
-const app = buildServer();
+const app = buildServer(config);
 
 try{
     await app.listen({port: config.port, host: config.host});

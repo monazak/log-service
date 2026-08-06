@@ -1,7 +1,8 @@
 export interface Config {
     readonly port: number;
     readonly host: string;
-    readonly loglevel: string;
+    readonly logLevel: string;
+    readonly isProduction: boolean;
 }
 
 function readPort (raw: string | undefined, fallback: number ):number {
@@ -19,9 +20,11 @@ function readPort (raw: string | undefined, fallback: number ):number {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) : Config {
+    const nodeEnv = env["NODE_ENV"] ?? "development";
     return{
         port:readPort(env["PORT"],8080),
         host: env["HOST"] ?? "0.0.0.0",
-        loglevel: env["LOG_LEVEL"] ?? "info",
+        logLevel: env["LOG_LEVEL"] ?? (nodeEnv === 'production'? 'warn' : 'info'),
+        isProduction: nodeEnv === "production",
     };
 }

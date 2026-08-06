@@ -58,3 +58,16 @@ Rationale:
 3. The ingestion write path will be rewritten during performance work
    (INSERT → batched COPY). Behind a repository boundary, that swap does not
    touch HTTP handlers.
+
+## Logging
+
+Application logging uses pino via Fastify. Per-request logging is disabled when
+NODE_ENV=production, and the default level rises from `info` to `warn`.
+
+Reason: at 15k logs/sec under a 0.5 CPU limit, per-request log serialization and
+blocking writes to stdout consume CPU needed for parsing and database writes.
+Docker's default json-file log driver also writes to disk without rotation, so
+sustained load tests can produce gigabytes of container logs.
+
+LOG_LEVEL overrides the default in any environment, so verbose debugging remains
+available in a running container.
