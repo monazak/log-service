@@ -174,3 +174,12 @@ Note: a partitioned table requires the partition key in the primary key, so the
 PK is `(timestamp, id)` rather than `(id)`. This matches the sort order the spec
 requires, so the constraint costs nothing. The BIGSERIAL sequence is shared across
 all partitions, keeping ids globally unique.
+
+## Timestamps
+
+All timestamp columns use `TIMESTAMPTZ`.
+
+`TIMESTAMP` stores a wall-clock reading with no zone, so `14:00Z` and `14:00+03:00`
+compare as equal when they are three hours apart. Since the ingestion API accepts
+any valid ISO 8601 offset and range queries must be correct, timestamps are
+normalized to UTC on storage.

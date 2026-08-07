@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS migration_smoke_test(
+    id INTEGER PRIMARY KEY,
+    ok BOOLEAN NOT NULL DEFAULT true
+);
