@@ -2,6 +2,8 @@
 
 A running log of choices made and why. Source material for the README.
 
+---
+
 ## Stack
 
 | Concern | Choice | Reason |
@@ -14,6 +16,8 @@ A running log of choices made and why. Source material for the README.
 | Tests | Vitest | Native TypeScript, no compile step |
 | Lint and format | Biome | One dependency, fast in CI |
 
+---
+
 ## No ORM
 
 Rejected Prisma and TypeORM because:
@@ -23,11 +27,13 @@ Rejected Prisma and TypeORM because:
 2. Hitting 15k logs/sec requires Postgres `COPY`, which ORMs do not expose.
 3. The app container has 256 MB RAM. Prisma's query engine is a significant
    fraction of that budget.
-4. Phase 4 uses time-partitioned tables; ORM schema tooling handles these poorly.
+4. The `logs` table uses time partitioning; ORM schema tooling handles these poorly.
 
 Accepted cost: SQL injection safety is now our responsibility. The spec treats
 injection as disqualifying. Mitigated by a single parameterized query builder
 (all user input via placeholders, identifiers via allow-list) and dedicated tests.
+
+---
 
 ## Validation split by call volume
 
@@ -37,6 +43,8 @@ format the spec requires.
 
 Config loading and query parameter parsing run a few times per second, so they
 use Zod, where clarity is worth more than nanoseconds.
+
+---
 
 ## Project structure
 
@@ -59,18 +67,35 @@ Rationale:
    (INSERT → batched COPY). Behind a repository boundary, that swap does not
    touch HTTP handlers.
 
+---
+
+## Import extensions
+
+Relative imports use the `.ts` extension, enabled by `allowImportingTsExtensions`
+and `rewriteRelativeImportExtensions`.
+
+Reason: the dev loop runs `.ts` files directly through Node's type stripping,
+which does not remap `.js` specifiers to `.ts` files. The production build runs
+compiled output in `dist/`, which needs `.js`. Writing `.ts` and letting the
+compiler rewrite on emit satisfies both without a second toolchain.
+
+---
+
 ## Logging
 
 Application logging uses pino via Fastify. Per-request logging is disabled when
-NODE_ENV=production, and the default level rises from `info` to `warn`.
+`NODE_ENV=production`, and the default level rises from `info` to `warn`.
 
 Reason: at 15k logs/sec under a 0.5 CPU limit, per-request log serialization and
 blocking writes to stdout consume CPU needed for parsing and database writes.
 Docker's default json-file log driver also writes to disk without rotation, so
 sustained load tests can produce gigabytes of container logs.
 
-LOG_LEVEL overrides the default in any environment, so verbose debugging remains
-available in a running container.
+`LOG_LEVEL` overrides the default in any environment, so verbose debugging remains
+available in a running container. Note that `LOG_LEVEL=debug` is therefore a
+performance switch, not only a verbosity switch — benchmark runs must leave it unset.
+
+---
 
 ## Resource limits and Node heap sizing
 
@@ -93,6 +118,46 @@ thread stacks) falls outside this limit. The remaining 64 MB is headroom.
 
 Expected trade-off: the GC runs more often under ingestion pressure. This is
 deliberate — predictable short pauses beat sudden process death.
+
+Note: in the dev override, `node --watch` keeps the container alive after a
+startup failure, so the port stays bound with no server behind it. Production
+runs `node dist/index.js` directly, so a startup failure exits the process and
+`restart: unless-stopped` retries. Startup failures should therefore always be
+verified against the production compose file.
+
+---
+
+## Connection pooling
+
+Pool size defaults to 8 (`DB_POOL_SIZE`), with `idleTimeoutMillis: 30000` and
+`connectionTimeoutMillis: 5000`.
+
+Postgres forks one OS process per connection, each holding memory against a 1 GB
+budget on a 1 CPU container. Oversized pools cause memory pressure and
+context-switch thrashing, reducing throughput rather than increasing it. The
+conventional starting point is `(cores * 2) + spindles`, which gives 3 here; 8
+allows headroom for burst without approaching the thrashing region.
+
+This is a number to measure, not assume. The performance phase will benchmark
+4 / 8 / 16 / 32 and record the result.
+
+Idle connections close after 30s so the pool shrinks between load phases,
+releasing database memory. Every borrowed client is released in a `finally`
+block — a leaked connection is never returned, and after `max` leaks the service
+hangs with no error.
+
+---
+
+## Timestamps
+
+All timestamp columns use `TIMESTAMPTZ`.
+
+`TIMESTAMP` stores a wall-clock reading with no zone, so `14:00Z` and `14:00+03:00`
+compare as equal when they are three hours apart. Since the ingestion API accepts
+any valid ISO 8601 offset and range queries must be correct, timestamps are
+normalized to UTC on storage.
+
+---
 
 ## Attribute storage: JSONB with a GIN index
 
@@ -122,6 +187,32 @@ All attribute values are therefore coerced to strings at ingestion time. This
 makes every equality filter a single containment check against one index, and
 matches the spec's response example, which shows attribute values as strings.
 
+---
+
+## Column types for `level` and `service`
+
+Both are `TEXT` with `CHECK` constraints rather than `ENUM`, `SMALLINT`, or a
+normalized lookup table.
+
+`level` — rejected `ENUM` because adding a value later requires `ALTER TYPE`,
+which is awkward inside transactions. Rejected `SMALLINT` because it requires
+conversion on every read and write and makes ad-hoc `psql` debugging opaque
+(`WHERE level = 3` communicates nothing). The theoretical saving is ~4 MB at 1M
+rows, and the composite index on `(service, timestamp)` does not include `level`
+anyway, so the saving is largely notional. `CHECK (level IN (...))` provides
+integrity without the type's costs.
+
+`service` — rejected a separate `services` table with a foreign key. It would add
+a join to every read query and a lookup-or-insert to every write, at 15k
+writes/sec on 1 CPU. Postgres also stores these columns as `extended`, meaning
+TOAST compresses repeated values automatically, so part of the expected
+normalization saving happens without the operational cost.
+
+General principle applied here: normalization trades operations for space. At
+15k writes/sec on a single CPU, operations are the scarcer resource.
+
+---
+
 ## Time partitioning
 
 The `logs` table is range-partitioned on `timestamp`, one partition per day.
@@ -146,6 +237,13 @@ Daily granularity chosen because the spec states ~1M rows ≈ one month. Daily g
 retention, coarse enough that planning overhead stays low. Hourly would produce
 720 partitions per month and slow query planning; monthly would make the smallest
 deletable unit an entire month.
+
+Note on constraint evaluation order: on a partitioned table, partition routing
+happens before CHECK constraints are evaluated, because the constraints live on
+the leaf partitions. A row whose timestamp matches no partition is rejected with
+"no partition found" regardless of whether its other columns are valid.
+
+---
 
 ## Primary key and deterministic ordering
 
@@ -175,11 +273,84 @@ PK is `(timestamp, id)` rather than `(id)`. This matches the sort order the spec
 requires, so the constraint costs nothing. The BIGSERIAL sequence is shared across
 all partitions, keeping ids globally unique.
 
-## Timestamps
+---
 
-All timestamp columns use `TIMESTAMPTZ`.
+## Substring search on `message` (the `q` parameter)
 
-`TIMESTAMP` stores a wall-clock reading with no zone, so `14:00Z` and `14:00+03:00`
-compare as equal when they are three hours apart. Since the ingestion API accepts
-any valid ISO 8601 offset and range queries must be correct, timestamps are
-normalized to UTC on storage.
+`pg_trgm` is enabled, but the trigram index is **not yet created**.
+
+The spec requires `q` to be a case-insensitive substring match, which compiles to
+`message ILIKE '%term%'`. A B-tree index cannot serve this: it is ordered
+lexically, so it can answer "starts with" but not "contains". Without a suitable
+index, every `q` query is a sequential scan over the full partition set.
+
+`pg_trgm` decomposes text into three-character sequences and indexes those with
+GIN, making mid-string matching index-assisted.
+
+The cost is real: a trigram index can exceed the size of the column it indexes,
+and every insert generates dozens of trigram entries to maintain. At 15k
+inserts/sec that is a direct tax on the primary throughput target.
+
+Decision deferred to the performance phase: measure the ingestion cost of the
+index against the query cost without it, and decide based on how frequently the
+load generator actually exercises `q`. Enabling the extension now avoids needing
+a separate migration later.
+
+---
+
+## Migrations
+
+Numbered `.sql` files in `src/db/migrations/`, applied by a custom ~60-line runner
+at startup, before the service reports ready.
+
+Each file runs inside its own transaction, so a failure leaves no partial schema
+and no recorded version — the next start retries cleanly. A Postgres advisory lock
+serialises concurrent instances, so two containers starting simultaneously cannot
+apply the same migration twice. The lock is held on a single dedicated client for
+the duration, since advisory locks are session-scoped.
+
+Rejected off-the-shelf migration tools because daily partition creation requires
+dynamic DDL that these tools model poorly, and because every line needs to be
+explicable during the demo.
+
+Note: `tsc` does not copy `.sql` files, so the build script explicitly copies
+`src/db/migrations` into `dist/db/migrations`.
+
+Operational rule: once a migration has been applied in any environment that
+matters, it is immutable. Changes go in a new numbered file. During early
+development `docker compose down -v` was used to reset after editing an applied
+migration; this is safe only because no other environment existed.
+
+---
+
+## Linting
+
+Biome, with `useLiteralKeys` disabled.
+
+That rule rewrites `env["PORT"]` to `env.PORT`. Bracket access is deliberate:
+combined with `noUncheckedIndexedAccess`, it types environment reads as
+`string | undefined`, forcing explicit handling of a missing variable. Dot access
+reads as a guaranteed property and hides that. Biome itself classifies the fix as
+unsafe.
+
+---
+
+## Startup ordering
+
+`src/index.ts` performs startup in a fixed order, and the order is load-bearing:
+
+1. `listen()` — the port opens; `/health` answers **503**
+2. `verifyConnection()` — database reachable
+3. `runMigrations()` — schema present
+4. `markReady()` — `/health` answers **200**
+
+The spec states the service must report healthy only after the database
+connection is established and migrations have been applied, and that the load
+generator polls `/health` before starting. Reporting ready early means 15k
+logs/sec arrive against an unprepared database; never reporting ready means the
+submission is not graded at all.
+
+Graceful shutdown reverses this: `markNotReady()` runs first so `/health` returns
+503 and traffic stops being routed, then in-flight requests drain, then Fastify's
+`onClose` hooks fire (closing the pool). A 10s timer force-exits if shutdown
+itself hangs; `stop_grace_period: 15s` in compose leaves 5s of margin above it.
