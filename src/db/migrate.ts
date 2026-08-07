@@ -63,3 +63,11 @@ export async function runMigrations(pool: pg.Pool): Promise<MigrationResult> {
     client.release();
   }
 }
+
+export async function ensurePartitions(pool: pg.Pool): Promise<number> {
+  const { rows } = await pool.query<{ ensure_log_partitions: number }>(
+    "SELECT ensure_log_partitions($1)",
+    [3],
+  );
+  return rows[0]?.ensure_log_partitions ?? 0;
+}
