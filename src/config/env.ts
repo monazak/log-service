@@ -3,6 +3,8 @@ export interface Config {
     readonly host: string;
     readonly logLevel: string;
     readonly isProduction: boolean;
+    readonly databaseUrl: string;
+    readonly dbPoolSize: number; 
 }
 
 function readPort (raw: string | undefined, fallback: number ):number {
@@ -19,6 +21,23 @@ function readPort (raw: string | undefined, fallback: number ):number {
     return parsed;
 }
 
+function readPositiveInt(
+    raw: string | undefined, 
+    fallback: number, 
+    name: string
+){
+    if(raw === undefined || raw ===''){
+        return fallback;
+    }
+    const parsed = Number(raw);
+    if(!Number.isInteger(parsed) || parsed < 1){
+        throw new Error(
+          `Invalid ${name}: expected a positive integer, received "${raw}"`,
+        );
+    }
+    return parsed;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) : Config {
     const nodeEnv = env["NODE_ENV"] ?? "development";
     return{
@@ -26,5 +45,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) : Config {
         host: env["HOST"] ?? "0.0.0.0",
         logLevel: env["LOG_LEVEL"] ?? (nodeEnv === 'production'? 'warn' : 'info'),
         isProduction: nodeEnv === "production",
+        databaseUrl:env["DATABASE_URL"] ?? 
+        "postgres://logservice:logservice@postgres:5432/logs",
+        dbPoolSize: readPositiveInt(env["DB_POOL_SIZE"], 8, "DB_POOL_SIZE")
     };
 }

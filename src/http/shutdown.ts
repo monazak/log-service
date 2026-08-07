@@ -36,7 +36,7 @@ export function registerShutdownHandlers(
 
         try{
             await app.close();
-            app.log.warn("Shutsown complete");
+            app.log.warn("Shutdown complete");
             process.exit(0);
         } catch(error) {
             app.log.error(error, "Error during shutdown");
