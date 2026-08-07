@@ -13,40 +13,40 @@ const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT"] as const;
  */
 
 export function registerShutdownHandlers(
-    app:FastifyInstance,
-    timeoutMs = 10_000,
-) : void {
-    let shuttingDown = false;
+  app: FastifyInstance,
+  timeoutMs = 10_000,
+): void {
+  let shuttingDown = false;
 
-    async function shutdown(signal: string) : Promise<void> {
-        if(shuttingDown){
-            return;
-        }
-        shuttingDown = true;
-        app.log.warn({signal}, "Shutdown signal received, closing gracefully");
-        // Stop reporting healthy so load balancers stop sending new traffic.
-        markNotReady();
-
-        const forceExit = setTimeout(()=>{
-            app.log.error("Graceful shutdown timed out, forcing exit");
-            process.exit(1);
-        },timeoutMs);
-
-        forceExit.unref();
-
-        try{
-            await app.close();
-            app.log.warn("Shutdown complete");
-            process.exit(0);
-        } catch(error) {
-            app.log.error(error, "Error during shutdown");
-            process.exit(1);
-        }
+  async function shutdown(signal: string): Promise<void> {
+    if (shuttingDown) {
+      return;
     }
+    shuttingDown = true;
+    app.log.warn({ signal }, "Shutdown signal received, closing gracefully");
+    // Stop reporting healthy so load balancers stop sending new traffic.
+    markNotReady();
 
-    for (const signal of SHUTDOWN_SIGNALS){
-        process.on(signal, () => {
-            void shutdown(signal);
-        });
+    const forceExit = setTimeout(() => {
+      app.log.error("Graceful shutdown timed out, forcing exit");
+      process.exit(1);
+    }, timeoutMs);
+
+    forceExit.unref();
+
+    try {
+      await app.close();
+      app.log.warn("Shutdown complete");
+      process.exit(0);
+    } catch (error) {
+      app.log.error(error, "Error during shutdown");
+      process.exit(1);
     }
+  }
+
+  for (const signal of SHUTDOWN_SIGNALS) {
+    process.on(signal, () => {
+      void shutdown(signal);
+    });
+  }
 }

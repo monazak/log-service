@@ -1,7 +1,7 @@
 import pg from "pg";
 import type { Config } from "../config/env.ts";
 
-const {Pool} = pg;
+const { Pool } = pg;
 
 /**
  * Creates the PostgreSQL connection pool.
@@ -11,24 +11,24 @@ const {Pool} = pg;
  * memory pressure and context-switch thrashing, reducing throughput rather than
  * increasing it.
  */
-export function createPool(config: Config){
-    return new Pool({
-        connectionString: config.databaseUrl,
-        max: config.dbPoolSize,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 5_000,
-        application_name: "log-service"
-    });
+export function createPool(config: Config) {
+  return new Pool({
+    connectionString: config.databaseUrl,
+    max: config.dbPoolSize,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 5_000,
+    application_name: "log-service",
+  });
 }
 
 /**
  * Verifies the database is reachable before the service reports ready.
  */
 export async function verifyConnection(pool: pg.Pool): Promise<void> {
-    const client = await pool.connect();
-    try{
-        await client.query("SELECT 1");
-    } finally {
-        client.release();
-    }
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT 1");
+  } finally {
+    client.release();
+  }
 }
