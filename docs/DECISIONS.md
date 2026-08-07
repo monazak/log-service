@@ -93,3 +93,56 @@ thread stacks) falls outside this limit. The remaining 64 MB is headroom.
 
 Expected trade-off: the GC runs more often under ingestion pressure. This is
 deliberate — predictable short pauses beat sudden process death.
+
+## Attribute storage: JSONB with a GIN index
+
+Chosen: a single `attributes JSONB` column, indexed with GIN (`jsonb_path_ops`).
+
+Rejected — EAV side table (`log_id`, `key`, `value`): at ~3 attributes per entry
+and 15k entries/sec, this turns 15k row inserts per second into 60k. Multi-key
+filters also require repeated self-joins against a table growing 3x faster than
+the log table itself. Not viable on a 1 CPU database.
+
+Rejected — hybrid with promoted columns for hot keys: the load generator's
+attribute keys are not known in advance, so promotion would be guesswork. Kept
+as a documented upgrade path if profiling in the performance phase identifies
+genuinely hot keys.
+
+Known limitation: JSONB repeats key names in every row, inflating storage
+relative to a normalized layout. Accepted in exchange for write throughput and
+schema flexibility.
+
+### Value normalization
+
+The spec requires `attr.<key>` to compare as strings, but permitted attribute
+values are strings, numbers, or booleans. JSONB distinguishes `3` from `"3"`, so
+`@> '{"retries":"3"}'` would not match a stored numeric `3`.
+
+All attribute values are therefore coerced to strings at ingestion time. This
+makes every equality filter a single containment check against one index, and
+matches the spec's response example, which shows attribute values as strings.
+
+## Time partitioning
+
+The `logs` table is range-partitioned on `timestamp`, one partition per day.
+
+Rejected — `DELETE FROM logs WHERE timestamp < ...` for retention. Postgres marks
+rows dead rather than removing them, so a delete reclaims no space until VACUUM
+runs. On a 1 CPU database under sustained ingestion, VACUUM competes directly with
+writes, and the deleted rows remain in the table and every index until it catches
+up. A 200k-row delete also locks each row individually and writes hundreds of MB
+of WAL. This breaks the spec requirement of "no long-running locks, excessive
+table bloat, or major ingestion disruption."
+
+`DROP TABLE logs_YYYY_MM_DD` is a metadata operation: milliseconds, full space
+reclaimed immediately, negligible WAL, zero bloat, no impact on concurrent writes.
+
+Secondary benefit: partition pruning. Queries with `since`/`until` skip
+non-matching partitions entirely at plan time, which directly serves the p95
+aggregation target.
+
+Daily granularity chosen because the spec states ~1M rows ≈ one month. Daily gives
+~33k rows per partition and ~30 live partitions — fine-grained enough for useful
+retention, coarse enough that planning overhead stays low. Hourly would produce
+720 partitions per month and slow query planning; monthly would make the smallest
+deletable unit an entire month.
