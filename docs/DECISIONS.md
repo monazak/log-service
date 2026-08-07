@@ -146,3 +146,31 @@ Daily granularity chosen because the spec states ~1M rows ≈ one month. Daily g
 retention, coarse enough that planning overhead stays low. Hourly would produce
 720 partitions per month and slow query planning; monthly would make the smallest
 deletable unit an entire month.
+
+## Primary key and deterministic ordering
+
+`id BIGSERIAL`, with `PRIMARY KEY (timestamp, id)`.
+
+The spec requires ordering to stay deterministic when timestamps collide, so all
+queries sort by `(timestamp DESC, id DESC)`. Without a tiebreaker, Postgres may
+return equal-timestamp rows in any order, which silently breaks keyset pagination:
+the same row can appear on two pages, or be skipped entirely.
+
+Rejected — UUID:
+
+- 16 bytes vs 8. At 1M rows that is 8 MB extra in the heap plus 8 MB in every
+  index containing it, against a 1 GB database memory budget.
+- UUIDv4 values are random, so each insert lands on an arbitrary B-tree page.
+  Sequential IDs always append to the rightmost page, which stays cached. At 15k
+  inserts/sec the random pattern causes measurably more page splits and WAL.
+- Generation cost is non-trivial at 15k/sec on 0.5 CPU.
+- Cursors carrying a UUID are larger and slower to parse.
+
+UUID would be correct with multiple uncoordinated writers, or if IDs had to be
+generated client-side before insert. Neither applies: a single database issues
+all IDs at write time.
+
+Note: a partitioned table requires the partition key in the primary key, so the
+PK is `(timestamp, id)` rather than `(id)`. This matches the sort order the spec
+requires, so the constraint costs nothing. The BIGSERIAL sequence is shared across
+all partitions, keeping ids globally unique.
