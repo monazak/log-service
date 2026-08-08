@@ -7,8 +7,8 @@ import { buildServer } from "./http/server.ts";
 import { registerShutdownHandlers } from "./http/shutdown.ts";
 
 const config = loadConfig();
-const app = buildServer(config);
 const pool = createPool(config);
+const app = buildServer(config, pool);
 
 let partitionTimer: NodeJS.Timeout | undefined;
 

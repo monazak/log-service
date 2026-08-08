@@ -354,3 +354,20 @@ Graceful shutdown reverses this: `markNotReady()` runs first so `/health` return
 503 and traffic stops being routed, then in-flight requests drain, then Fastify's
 `onClose` hooks fire (closing the pool). A 10s timer force-exits if shutdown
 itself hangs; `stop_grace_period: 15s` in compose leaves 5s of margin above it.
+
+## Health check strategy
+
+`GET /health` performs a live `SELECT 1`, cached for 5 seconds.
+
+The load generator polls this endpoint continuously and begins sending 15k
+logs/sec on the first 200, so the answer must be honest and cheap. A purely
+in-memory flag would keep reporting healthy after the database dropped, and the
+generator would keep sending data that cannot be stored. Querying on every poll
+would instead consume the small connection pool that ingestion depends on.
+
+Caching bounds the cost at one query per 5 seconds regardless of poll rate. The
+check carries a 2s query timeout so a slow database cannot block the endpoint,
+and recovery is automatic — no restart is needed once the database returns.
+
+Startup state is tracked separately from the liveness check, so "still starting"
+and "database unavailable" are distinguishable and the former costs no query.

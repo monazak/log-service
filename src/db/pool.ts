@@ -11,14 +11,16 @@ const { Pool } = pg;
  * memory pressure and context-switch thrashing, reducing throughput rather than
  * increasing it.
  */
-export function createPool(config: Config) {
-  return new Pool({
+export function createPool(config: Config): pg.Pool {
+  const pool = new Pool({
     connectionString: config.databaseUrl,
     max: config.dbPoolSize,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
     application_name: "log-service",
   });
+  pool.on("error", () => {});
+  return pool;
 }
 
 /**
