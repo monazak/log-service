@@ -18,7 +18,7 @@ export interface ValidLogEntry {
   readonly timestamp: Date;
   readonly level: LogLevel;
   readonly service: string;
-  readonly messsage: string;
+  readonly message: string;
   readonly attributes: Attributes;
 }
 
