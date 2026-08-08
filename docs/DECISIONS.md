@@ -371,3 +371,22 @@ and recovery is automatic — no restart is needed once the database returns.
 
 Startup state is tracked separately from the liveness check, so "still starting"
 and "database unavailable" are distinguishable and the former costs no query.
+
+## Ingestion write path
+
+Batches are written with a single multi-row `INSERT` per chunk of up to 5000
+entries, not one statement per entry. Each round trip to Postgres costs more
+than the insert itself, so batching converts N round trips into one.
+
+Chunking exists because Postgres caps a statement at 65535 bind parameters
+(13107 rows at five columns) and because a single oversized statement would hold
+a large parameter array and query string in a 256 MB process.
+
+Dynamic SQL is limited to generating positional placeholders (`$1`, `$2`, ...)
+from a loop counter. No user-supplied value ever enters the query text; values
+travel separately in the parameter array and are never parsed as SQL.
+
+This is the correct-but-unoptimized implementation. `COPY` is the expected
+upgrade, deferred to the performance phase so the decision rests on a measured
+comparison. The `insertLogs(pool, entries)` signature is the boundary that keeps
+that swap invisible to callers.
