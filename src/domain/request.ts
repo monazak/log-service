@@ -10,7 +10,7 @@ export type EnvelopeResult =
   | { readonly ok: true; readonly logs: readonly unknown[] }
   | { readonly ok: false; readonly error: string };
 
-export function paresLogsEnvelope(body: unknown): EnvelopeResult {
+export function parseLogsEnvelope(body: unknown): EnvelopeResult {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return { ok: false, error: "request body must be a JSON object" };
   }
