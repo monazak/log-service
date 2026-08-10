@@ -5,6 +5,7 @@ export interface Config {
   readonly isProduction: boolean;
   readonly databaseUrl: string;
   readonly dbPoolSize: number;
+  readonly retentionDays: number;
 }
 
 function readPort(raw: string | undefined, fallback: number): number {
@@ -42,5 +43,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl:
       env["DATABASE_URL"] ?? "postgres://logservice:logservice@postgres:5432/logs",
     dbPoolSize: readPositiveInt(env["DB_POOL_SIZE"], 8, "DB_POOL_SIZE"),
+    retentionDays: readPositiveInt(env["RETENTION_DAYS"], 30, "RETENTION_DAYS"),
   };
 }

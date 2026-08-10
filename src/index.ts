@@ -2,6 +2,7 @@ import { loadConfig } from "./config/env.ts";
 import { ensurePartitions, runMigrations } from "./db/migrate.ts";
 import { startPartitionScheduler } from "./db/partitionScheduler.ts";
 import { createPool, verifyConnection } from "./db/pool.ts";
+import { dropExpiredPartitions, startRetentionScheduler } from "./db/retention.ts";
 import { markReady } from "./http/readiness.ts";
 import { buildServer } from "./http/server.ts";
 import { registerShutdownHandlers } from "./http/shutdown.ts";
@@ -11,9 +12,13 @@ const pool = createPool(config);
 const app = buildServer(config, pool);
 
 let partitionTimer: NodeJS.Timeout | undefined;
+let retentionTimer: NodeJS.Timeout | undefined;
 
 app.addHook("onClose", async () => {
   if (partitionTimer !== undefined) {
+    clearInterval(partitionTimer);
+  }
+  if (retentionTimer !== undefined) {
     clearInterval(partitionTimer);
   }
   app.log.warn("Closing database pool");
@@ -33,8 +38,17 @@ try {
 
   const partitions = await ensurePartitions(pool);
   app.log.info({ created: partitions }, "Partitions ensured");
-  startPartitionScheduler(app, pool);
 
+  partitionTimer = startPartitionScheduler(app, pool);
+  const expired = await dropExpiredPartitions(pool, config.retentionDays);
+  if (expired.length > 0) {
+    app.log.warn(
+      { dropped: expired, retentionDays: config.retentionDays },
+      "Retention dropped expired partitions at startup",
+    );
+  }
+
+  retentionTimer = startRetentionScheduler(app, pool, config.retentionDays);
   markReady();
   app.log.info("Service is ready to accept traffic");
 } catch (error) {
