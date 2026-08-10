@@ -1,7 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
-import { insertLogs } from "../../db/repositories/logRepository.ts";
+import { insertLogs, queryLogs } from "../../db/repositories/logRepository.ts";
 import { validateBatch } from "../../domain/batch.ts";
+import {
+  type CursorPosition,
+  decodeCursor,
+  encodeCursor,
+} from "../../domain/cursor.ts";
+import { parseLogFilters } from "../../domain/query.ts";
 import { parseLogsEnvelope } from "../../domain/request.ts";
 
 /**
@@ -27,6 +33,42 @@ export function registerLogRoutes(app: FastifyInstance, pool: pg.Pool): void {
     return reply.code(200).send({
       accepted: valid.length,
       rejected,
+    });
+  });
+
+  app.get("/logs", async (request, reply) => {
+    const parsed = parseLogFilters(request.query as Record<string, unknown>);
+    if (!parsed.ok) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+    const filters = parsed.filters;
+    let cursor: CursorPosition | undefined;
+
+    if (filters.cursor !== undefined) {
+      const decoded = decodeCursor(filters.cursor);
+
+      if (!decoded.ok) {
+        return reply.code(400).send({ error: decoded.error });
+      }
+      cursor = decoded.position;
+    }
+
+    const { rows, hasMore } = await queryLogs(pool, filters, cursor);
+    const last = rows[rows.length - 1];
+
+    const nextCursor =
+      hasMore && last !== undefined ? encodeCursor(last.timestamp, last.id) : null;
+
+    return reply.code(200).send({
+      logs: rows.map((row) => ({
+        id: row.id,
+        timestamp: row.timestamp.toISOString(),
+        level: row.level,
+        service: row.service,
+        message: row.message,
+        attributes: row.attributes,
+      })),
+      next_cursor: nextCursor,
     });
   });
 }

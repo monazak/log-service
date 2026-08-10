@@ -1,5 +1,8 @@
 import type pg from "pg";
+import type { CursorPosition } from "../../domain/cursor.ts";
 import type { ValidLogEntry } from "../../domain/log.ts";
+import type { LogFilters } from "../../domain/query.ts";
+import { buildWhereClause } from "../queries/whereClause.ts";
 
 /**
  * Persistence for log entries.
@@ -16,6 +19,15 @@ import type { ValidLogEntry } from "../../domain/log.ts";
 /** Postgres caps a statement at 65535 parameters; 5 columns means 13107 rows. */
 
 const MAX_ROWS_PER_STATEMENT = 5000;
+
+export interface LogRow {
+  readonly id: string;
+  readonly timestamp: Date;
+  readonly level: string;
+  readonly service: string;
+  readonly message: string;
+  readonly attributes: Record<string, string>;
+}
 
 export async function insertLogs(
   pool: pg.Pool,
@@ -69,4 +81,30 @@ async function insertChunk(
   const result = await pool.query(sql, values);
 
   return result.rowCount ?? 0;
+}
+
+export async function queryLogs(
+  pool: pg.Pool,
+  filters: LogFilters,
+  cursor?: CursorPosition,
+): Promise<{ rows: LogRow[]; hasMore: boolean }> {
+  const where = buildWhereClause(filters, cursor);
+
+  const sql = `
+    SELECT id, "timestamp", level, service, message, attributes
+    FROM logs
+    ${where.sql}
+    ORDER BY "timestamp" DESC, id DESC
+    LIMIT $${where.values.length + 1}
+  `;
+
+  const values = [...where.values, filters.limit + 1];
+
+  const result = await pool.query<LogRow>(sql, values);
+
+  const hasMore = result.rows.length > filters.limit;
+
+  const rows = hasMore ? result.rows.slice(0, filters.limit) : result.rows;
+
+  return { rows, hasMore };
 }
