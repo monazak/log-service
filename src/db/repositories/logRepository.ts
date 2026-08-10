@@ -1,7 +1,9 @@
 import type pg from "pg";
+import type { AggregateParams } from "../../domain/aggregate.ts";
 import type { CursorPosition } from "../../domain/cursor.ts";
 import type { ValidLogEntry } from "../../domain/log.ts";
 import type { LogFilters } from "../../domain/query.ts";
+import { buildAggregateQuery } from "../queries/aggregateQuery.ts";
 import { buildWhereClause } from "../queries/whereClause.ts";
 
 /**
@@ -27,6 +29,12 @@ export interface LogRow {
   readonly service: string;
   readonly message: string;
   readonly attributes: Record<string, string>;
+}
+
+export interface AggregateRow {
+  readonly bucket_start: Date;
+  readonly grp: string | null;
+  readonly cnt: string;
 }
 
 export async function insertLogs(
@@ -107,4 +115,13 @@ export async function queryLogs(
   const rows = hasMore ? result.rows.slice(0, filters.limit) : result.rows;
 
   return { rows, hasMore };
+}
+
+export async function aggregateLogs(
+  pool: pg.Pool,
+  params: AggregateParams,
+): Promise<AggregateRow[]> {
+  const query = buildAggregateQuery(params);
+  const result = await pool.query<AggregateRow>(query.sql, query.values);
+  return result.rows;
 }

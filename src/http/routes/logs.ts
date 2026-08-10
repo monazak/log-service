@@ -1,6 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
-import { insertLogs, queryLogs } from "../../db/repositories/logRepository.ts";
+import {
+  aggregateLogs,
+  insertLogs,
+  queryLogs,
+} from "../../db/repositories/logRepository.ts";
+import { parseAggregateParams } from "../../domain/aggregate.ts";
 import { validateBatch } from "../../domain/batch.ts";
 import {
   type CursorPosition,
@@ -69,6 +74,23 @@ export function registerLogRoutes(app: FastifyInstance, pool: pg.Pool): void {
         attributes: row.attributes,
       })),
       next_cursor: nextCursor,
+    });
+  });
+
+  app.get("/logs/aggregate", async (request, reply) => {
+    const parsed = parseAggregateParams(request.query as Record<string, unknown>);
+    if (!parsed.ok) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+
+    const rows = await aggregateLogs(pool, parsed.params);
+
+    return reply.code(200).send({
+      buckets: rows.map((row) => ({
+        start: row.bucket_start.toISOString(),
+        group: row.grp,
+        count: Number(row.cnt),
+      })),
     });
   });
 }
