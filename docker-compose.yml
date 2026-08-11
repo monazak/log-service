@@ -1,6 +1,18 @@
 services:
   postgres:
     image: postgres:17-alpine
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "effective_cache_size=768MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "random_page_cost=1.1"
     environment:
       POSTGRES_USER: logservice
       POSTGRES_PASSWORD: logservice

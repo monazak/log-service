@@ -92,3 +92,38 @@ Indexes total 229 MB against 173 MB of heap. `shared_buffers` defaults to 128 MB
 so the working set does not fit in cache. The GIN index on `attributes` is 135 MB
 of that, inflated by `request_id` being unique per row — 1M index entries serving
 a lookup pattern that is rarely exercised.
+
+## Optimization 1: PostgreSQL memory and cost settings
+
+Applied via `command:` in docker-compose.yml:
+
+| Setting | Default | Applied | Reason |
+|---|---|---|---|
+| `shared_buffers` | 128 MB | 256 MB | ~25% of the 1 GB container limit |
+| `work_mem` | 4 MB | 32 MB | Baseline sort spilled to disk at 4 MB |
+| `effective_cache_size` | 4 GB | 768 MB | Planner estimate matching the container |
+| `maintenance_work_mem` | 64 MB | 128 MB | Autovacuum keeps up under ingestion |
+| `random_page_cost` | 4.0 | 1.1 | Default assumes spinning disks; this is SSD |
+
+### Result: 7-day hourly aggregate
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Sort method | external merge, Disk 2552 kB | quicksort, Memory 6145 kB | spill eliminated |
+| Sort node | 74.3 ms | 53.5 ms | −28% |
+| Append node | 61.3 ms | 43.3 ms | −29% |
+| **Execution** | **97.8 ms** | **81.2 ms** | **−17%** |
+| Planning | 10.4 ms | 14.5 ms | +39% |
+
+The Append improvement was not the direct target: larger `shared_buffers` keeps
+index pages cached across the scan rather than re-reading them.
+
+Planning got *slower*. Lowering `random_page_cost` and raising
+`effective_cache_size` make the planner evaluate index paths it previously
+dismissed on cost. This confirms planning overhead is a function of partition
+count, not memory, and will not be fixed by configuration.
+
+`work_mem` is allocated per sort operation, not per connection. With a pool of 8,
+worst case is 8 × 32 MB = 256 MB on top of 256 MB shared_buffers, leaving
+headroom inside the 1 GB limit. This bound only holds because the pool is small —
+a decision made in phase 4 that constrains this one.
