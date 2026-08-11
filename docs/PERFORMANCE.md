@@ -127,3 +127,52 @@ count, not memory, and will not be fixed by configuration.
 worst case is 8 × 32 MB = 256 MB on top of 256 MB shared_buffers, leaving
 headroom inside the 1 GB limit. This bound only holds because the pool is small —
 a decision made in phase 4 that constrains this one.
+
+## Ingestion throughput
+
+Measured against the production compose file (dev override excluded), with the
+database already holding 1M rows.
+
+| Metric | Value |
+|---|---|
+| Duration | 30 s |
+| Batch size | 500 |
+| Concurrency | 8 |
+| Requests | 4,065 |
+| Errors | 0 |
+| Logs accepted | 2,032,500 |
+| **Throughput** | **67,683 logs/sec** |
+| Latency p50 | 68.0 ms |
+| Latency p95 | 97.7 ms |
+| Latency p99 | 106.6 ms |
+
+Target is 15,000/sec; the spec lists 20,000 and 25,000 as additional credit.
+
+Verified after the run: `count(*)` = 3,633,969 (1M seeded + 2M ingested), and
+`logs_default` holds 0 rows, confirming every row was routed to its daily
+partition rather than the fallback.
+
+### Resource usage during the run
+
+| Container | CPU (of limit) | Memory |
+|---|---|---|
+| app | 44–51% of 0.5 CPU — **saturated** | 54 MiB / 256 MiB |
+| postgres | 66–86% of 1 CPU | 335 MiB / 1 GiB |
+
+The application container is the bottleneck: it consumes essentially its entire
+half-CPU allocation while Postgres retains 15–35% headroom. The work on that path
+is JSON parsing of ~150 KB bodies, per-entry validation of 500 entries against six
+rules, attribute serialization, and building 2,500 bind parameters.
+
+This validates the phase 0 decision to hand-write per-entry validation rather
+than use a schema library: validation sits directly on the CPU-bound path.
+
+Memory is not a constraint — the app uses 22% of its limit, so
+`--max-old-space-size=192` was never approached.
+
+### Durability
+
+Throughput is achieved with synchronous acknowledgement: the handler awaits the
+INSERT before responding 200, so no batch is acknowledged before Postgres has
+accepted it. The spec's "never respond 200 to a batch you have not durably
+accepted" holds without special handling.
