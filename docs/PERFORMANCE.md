@@ -1,7 +1,10 @@
 # Performance
 
-All measurements taken with container limits applied
-(app: 0.5 CPU / 256 MB, postgres: 1 CPU / 1 GB).
+All measurements taken against the production compose file (dev override
+excluded), with container limits applied: app 0.5 CPU / 256 MB, postgres
+1 CPU / 1 GB.
+
+---
 
 ## Test environment
 
@@ -10,6 +13,30 @@ All measurements taken with container limits applied
 - Docker Desktop on macOS runs containers inside a Linux VM. Disk and network
   cross that boundary, so these numbers are expected to be lower than the same
   stack on native Linux.
+
+### Measurement protocol
+
+Every run is preceded by:
+
+```
+DELETE FROM logs WHERE "timestamp" >= CURRENT_DATE - 1;
+VACUUM FULL ANALYZE logs;
+SELECT count(*) FROM logs;
+```
+
+Row count and heap size are recorded alongside every result. This protocol was
+adopted after several comparisons were invalidated — see "Measurement discipline"
+below.
+
+### Tooling
+
+| Script | Purpose |
+|---|---|
+| `scripts/seed.sql` | Generates 1M rows over 30 days directly in the database. Setup, not measurement. |
+| `scripts/loadgen.mjs` | Ingestion load over HTTP `POST /logs` — the path the grader exercises. Fixed concurrency, not fixed rate, so throughput is bounded by the service. |
+| `scripts/querygen.mjs` | One aggregate request per second, matching the spec's stated query rate. |
+
+---
 
 ## Dataset
 
@@ -31,47 +58,33 @@ All measurements taken with container limits applied
 | primary key (timestamp, id) | 36 MB | 16% |
 
 The GIN index alone is 78% the size of the heap it indexes. `request_id` is
-unique per row, so it contributes ~1M index entries for a lookup pattern that is
-rarely used — a candidate for exclusion, measured rather than assumed.
+unique per row in the seed data, contributing ~1M index entries for a lookup
+pattern that is rarely exercised.
 
-## Baseline: aggregation
+---
 
-Query: hourly buckets over a 7-day range (~230k rows), no grouping.
-
-| Metric | Value |
-|---|---|
-| Planning time | 10.4 ms |
-| Execution time | 97.8 ms |
-| Spec target | < 1000 ms at p95 |
-
-Execution is well inside target. Planning time is the concern: it grew from
-2.6 ms at 9 partitions to 10.4 ms at 36, roughly linear in partition count, and
-is paid on every request with no caching. At 60 days of retention this would
-approach 20 ms per request against a 1 CPU database that is also ingesting.
-
-## Bottlenecks identified
-
-_(to be filled as measured)_
-
-## Optimizations applied
-
-_(to be filled as applied)_
-
-## Baseline measurements (1M rows, 36 partitions)
+## Baseline query plans (1M rows, 36 partitions)
 
 | Query | Planning | Execution | Notes |
 |---|---|---|---|
-| `attr.user_id=42`, no time range | 11.4 ms | 1.9 ms | Bitmap Index Scan on GIN, all 36 partitions probed |
-| `service` + 1-day range, limit 100 | 14.4 ms | 0.8 ms | 35 of 36 partitions pruned at runtime |
-| hourly aggregate, 7-day range | 10.4 ms | 97.8 ms | 7 partitions scanned, sort spills to disk |
+| `attr.user_id=42`, no time range | 11.4 ms | 1.9 ms | Bitmap Index Scan on GIN; all 36 partitions probed |
+| `service` + 1-day range, limit 100 | 14.4 ms | 0.8 ms | `Subplans Removed: 35` — 35 of 36 partitions pruned |
+| hourly aggregate, 7-day range | 10.4 ms | 97.8 ms | 7 partitions scanned; sort spilled to disk |
+
+The same attribute query planned as a `Seq Scan` at 16 rows during development.
+The planner chooses by cost, and cost changes with scale — index design cannot be
+evaluated on a development dataset.
+
+---
 
 ## Bottlenecks identified
 
 ### 1. Planning time exceeds execution time on point queries
 
-Planning costs 10–14 ms regardless of query, because the planner evaluates all
-36 partitions before pruning them. Two of the three queries above spend more
-time being planned than executed. Planning is paid per request and is not cached.
+Planning costs 10–14 ms regardless of query shape, because the planner evaluates
+all 36 partitions before pruning them. Two of the three baseline queries spend
+more time being planned than executed. Planning is paid per request and is not
+cached.
 
 Growth is roughly linear in partition count: 2.6 ms at 9 partitions, 10.4 ms at
 36. At 60-day retention this would approach 25 ms per request on a 1 CPU database
@@ -79,23 +92,29 @@ that is concurrently ingesting.
 
 ### 2. Aggregation sort spills to disk
 
-`Sort Method: external merge  Disk: 2552kB`
+```
+Sort Method: external merge  Disk: 2552kB
+```
 
-The sort consumes 74 ms of the 97 ms execution time. `work_mem` defaults to 4 MB,
-which is insufficient for 216k rows, so intermediate results are written to disk.
-The planner also chose `GroupAggregate` (which requires sorted input) over
-`HashAggregate` (which does not) — a direct consequence of the memory limit.
+The sort consumed 74 ms of 97 ms total execution. `work_mem` defaults to 4 MB,
+insufficient for 216k rows. The planner also chose `GroupAggregate` (requiring
+sorted input) over `HashAggregate` — a direct consequence of the memory limit.
 
 ### 3. Index size relative to available cache
 
 Indexes total 229 MB against 173 MB of heap. `shared_buffers` defaults to 128 MB,
-so the working set does not fit in cache. The GIN index on `attributes` is 135 MB
-of that, inflated by `request_id` being unique per row — 1M index entries serving
-a lookup pattern that is rarely exercised.
+so the working set does not fit in cache.
+
+### 4. Aggregation degrades sharply under concurrent ingestion
+
+Detailed below. The database saturates at 100% of its single CPU during
+ingestion, and aggregation runs on what remains.
+
+---
 
 ## Optimization 1: PostgreSQL memory and cost settings
 
-Applied via `command:` in docker-compose.yml:
+Applied via `command:` in `docker-compose.yml`:
 
 | Setting | Default | Applied | Reason |
 |---|---|---|---|
@@ -124,50 +143,67 @@ dismissed on cost. This confirms planning overhead is a function of partition
 count, not memory, and will not be fixed by configuration.
 
 `work_mem` is allocated per sort operation, not per connection. With a pool of 8,
-worst case is 8 × 32 MB = 256 MB on top of 256 MB shared_buffers, leaving
+worst case is 8 × 32 MB = 256 MB on top of 256 MB `shared_buffers`, leaving
 headroom inside the 1 GB limit. This bound only holds because the pool is small —
-a decision made in phase 4 that constrains this one.
+a decision made in the schema phase that constrains this one.
+
+---
 
 ## Ingestion throughput
 
-Measured against the production compose file (dev override excluded), with the
-database already holding 1M rows.
+Two measurements were taken. The first is included because its flaw is
+instructive.
+
+### First measurement — invalidated
 
 | Metric | Value |
 |---|---|
-| Duration | 30 s |
+| Throughput | 67,683 logs/sec |
+| Latency p95 | 97.7 ms |
+
+The load generator initially spread timestamps over 1 second, so every ingested
+row landed in the same hourly bucket: one bucket held 6.1M rows against ~1,400 in
+every other. Consecutive inserts into a single hot index page are cheaper than
+inserts distributed across many, so this figure was optimistic.
+
+### Corrected measurement (timestamps spread over 24 hours)
+
+| Metric | Value |
+|---|---|
+| Duration | 60 s |
 | Batch size | 500 |
 | Concurrency | 8 |
-| Requests | 4,065 |
+| Requests | 5,177 |
 | Errors | 0 |
-| Logs accepted | 2,032,500 |
-| **Throughput** | **67,683 logs/sec** |
-| Latency p50 | 68.0 ms |
-| Latency p95 | 97.7 ms |
-| Latency p99 | 106.6 ms |
+| Logs accepted | 2,588,500 |
+| **Throughput** | **43,117 logs/sec** |
+| Latency p50 | 95.0 ms |
+| Latency p95 | 186.4 ms |
+| Latency p99 | 204.5 ms |
 
 Target is 15,000/sec; the spec lists 20,000 and 25,000 as additional credit.
 
-Verified after the run: `count(*)` = 3,633,969 (1M seeded + 2M ingested), and
-`logs_default` holds 0 rows, confirming every row was routed to its daily
-partition rather than the fallback.
+Verified after each run: `logs_default` holds 0 rows, confirming every row was
+routed to its daily partition rather than the fallback.
 
-### Resource usage during the run
+### Where the bottleneck sits
 
-| Container | CPU (of limit) | Memory |
+| Run | app CPU (of 0.5) | postgres CPU (of 1.0) |
 |---|---|---|
-| app | 44–51% of 0.5 CPU — **saturated** | 54 MiB / 256 MiB |
-| postgres | 66–86% of 1 CPU | 335 MiB / 1 GiB |
+| Ingestion only, 1-second timestamp spread | 44–51% — saturated | 66–86% |
+| Ingestion only, 24-hour timestamp spread | 25–29% | **100% — saturated** |
 
-The application container is the bottleneck: it consumes essentially its entire
-half-CPU allocation while Postgres retains 15–35% headroom. The work on that path
-is JSON parsing of ~150 KB bodies, per-entry validation of 500 entries against six
-rules, attribute serialization, and building 2,500 bind parameters.
+The bottleneck moves with the write pattern. With timestamps concentrated in one
+second, the application was the constraint: JSON parsing of ~150 KB bodies,
+per-entry validation of 500 entries against six rules, attribute serialization,
+and building 2,500 bind parameters. With a realistic 24-hour spread, inserts land
+in two partitions across many index pages, and Postgres becomes the constraint.
 
-This validates the phase 0 decision to hand-write per-entry validation rather
-than use a schema library: validation sits directly on the CPU-bound path.
+The application-bound case validates the decision to hand-write per-entry
+validation rather than use a schema library: validation sits directly on the
+CPU-bound path.
 
-Memory is not a constraint — the app uses 22% of its limit, so
+Memory is never a constraint — the app peaks at 22% of its 256 MB limit, so
 `--max-old-space-size=192` was never approached.
 
 ### Durability
@@ -175,4 +211,117 @@ Memory is not a constraint — the app uses 22% of its limit, so
 Throughput is achieved with synchronous acknowledgement: the handler awaits the
 INSERT before responding 200, so no batch is acknowledged before Postgres has
 accepted it. The spec's "never respond 200 to a batch you have not durably
-accepted" holds without special handling.
+accepted" holds without special handling — no in-memory buffering is involved.
+
+---
+
+## Concurrent load: aggregation under ingestion
+
+All three runs start from an identical state: 966,812 rows, 167 MB heap,
+reset via `DELETE` + `VACUUM FULL ANALYZE`.
+
+Query: hourly buckets over a rolling 7-day window, 1 request/sec.
+
+| Concurrency | Ingestion | Ingest p50 | Aggregate p50 | Aggregate p95 |
+|---|---|---|---|---|
+| — (aggregation alone) | — | — | 66 ms | **104 ms** |
+| 8 | 43,117/sec | 95.0 ms | 1,203 ms | **2,715 ms** |
+| 4 | 50,177/sec | 19.3 ms | 878 ms | **1,600 ms** |
+| 2 | 49,357/sec | 13.3 ms | 568 ms | **1,429 ms** |
+
+### Reading the sweep
+
+**Throughput is flat across all three settings.** The database is the constraint,
+so additional in-flight requests add queueing rather than work.
+
+**Ingest p50 falls 7x from concurrency 8 to 2** (95 ms → 13 ms) for the same
+reason: requests stop waiting behind each other. This mirrors the connection-pool
+reasoning from the schema phase at the request level — more concurrency against a
+saturated single CPU is contention, not capacity.
+
+**Aggregate p95 improves 47% but plateaus around 1,400 ms**, still above the
+1,000 ms target. At concurrency 2, Postgres runs at 87–92% rather than 100%, and
+the query still costs 1,429 ms against 104 ms with the CPU free — a 14x
+degradation.
+
+The remaining cost is the work itself: after a 60-second ingestion run the 7-day
+window contains ~3M rows, and counting them requires reading them.
+
+### Why lowering concurrency is not the fix
+
+Concurrency is a property of the client, not the service. The grader's load
+generator controls its own. These runs establish the shape of the problem — the
+database saturates and aggregation starves — but the remedy has to live in the
+service.
+
+Candidate remedies, in order of expected value:
+
+1. **Pre-aggregated rollup tables.** Compute buckets on write rather than on
+   read, turning a 3M-row scan into a ~1,000-row lookup. The spec's 20-second
+   visibility allowance means rollups can be refreshed periodically rather than
+   per insert, keeping the cost off the ingestion path.
+2. **`statement_timeout`.** Bound the damage a single expensive query can do to
+   concurrent writers.
+3. **Write concurrency limiting inside the service**, so the service controls
+   contention rather than the client.
+
+---
+
+## Measurement discipline
+
+Several comparisons in this phase were invalidated before the protocol above was
+adopted. Recording them is part of the result.
+
+### Load generator timestamp distribution
+
+The generator initially spread timestamps over 1 second. Every ingested row
+landed in one hourly bucket — 6.1M rows against ~1,400 elsewhere. Aggregation
+over a 7-day window scanned 6.3M rows instead of ~230k, and p95 measured 4,180 ms.
+This was a flaw in the harness, not the service.
+
+### State not reset between runs
+
+An early comparison suggested that *lowering* ingestion concurrency from 8 to 4
+made aggregation four times worse (1,703 ms → 6,577 ms p95) — which contradicts
+any contention explanation. The cause: each run appends millions of rows, so each
+successive test queried a larger dataset than the one before. The settings were
+never compared under equal conditions.
+
+### DELETE bloat, quantified
+
+Test rows were removed between runs with `DELETE` + `VACUUM ANALYZE`. Aggregation
+p95 on ~966k rows then measured 1,617 ms — 15x slower than the 104 ms measured on
+the same row count after a full reset.
+
+| State | Rows | Heap |
+|---|---|---|
+| Before `VACUUM FULL` | 966,812 | 547 MB |
+| After `VACUUM FULL` | 966,812 | 167 MB |
+
+380 MB — 70% of the table — was dead space. Plain `VACUUM` returns that space for
+internal reuse but not to the filesystem, so every scan was reading pages that
+were largely empty.
+
+`VACUUM FULL` reclaimed it, but rewrites the entire table under an exclusive lock
+and is unusable while ingesting.
+
+**This is the experimental basis for the retention design chosen in the schema
+phase.** `DROP TABLE partition` reclaims the same space as a metadata operation —
+no lock, no rewrite, no accumulated bloat. The 380 MB above is what row-level
+DELETE costs in practice.
+
+---
+
+## Status against spec targets
+
+| Target | Result | |
+|---|---|---|
+| Sustain ≥ 15,000 logs/sec | 43,117–50,177/sec | ✅ |
+| No dropped requests or crashes | 0 errors across all runs | ✅ |
+| ~1,000,000 stored rows | 966,812 baseline, 3M+ under load | ✅ |
+| Aggregation p95 < 1s (idle) | 104 ms | ✅ |
+| **Aggregation p95 < 1s (under ingestion)** | **1,429–2,715 ms** | ❌ |
+| 1 aggregate/sec during ingestion | Achieved at concurrency 2 and 4; degraded to 22–27 of 30 at concurrency 8 | ⚠️ |
+
+The outstanding item is aggregation latency under concurrent ingestion. Rollup
+tables are the intended remedy.
