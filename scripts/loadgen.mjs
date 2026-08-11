@@ -33,7 +33,7 @@ function makeBatch(size) {
 
   for (let i = 0; i < size; i += 1) {
     logs[i] = {
-      timestamp: new Date(now - Math.floor(Math.random() * 1000)).toISOString(),
+      timestamp: new Date(now - Math.floor(Math.random() * 86_400_000)).toISOString(),
       level: pick(LEVELS),
       service: pick(SERVICES),
       message: `${pick(MESSAGES)} ${Math.floor(Math.random() * 1e6)}`,
