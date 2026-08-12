@@ -325,3 +325,48 @@ DELETE costs in practice.
 
 The outstanding item is aggregation latency under concurrent ingestion. Rollup
 tables are the intended remedy.
+
+## Optimization 2: Pre-aggregated rollup table
+
+Aggregation over the raw table scans every row in range. Under load the 7-day
+window holds millions of rows, and counting them requires reading them.
+
+`log_rollup_1m` stores `(bucket, service, level, count)` at 1-minute granularity.
+All four spec bucket sizes are derived by summing minutes; both `group_by` options
+are derived by summing across the other dimension.
+
+Refreshed on a 10-second timer, not by trigger. A trigger would execute ~43,000
+times per second on the write path; the timer executes 0.1 times per second — a
+430,000x difference in how often the cost is paid. The spec's 20-second visibility
+allowance is what makes deferred refresh legitimate.
+
+| Query | Raw table | Rollup | Change |
+|---|---|---|---|
+| hourly buckets, 7-day range | 3,080.7 ms | **64.8 ms** | **−98%** |
+
+Rollup table size: 65 MB / 553,523 rows against 167 MB for the raw partitions —
+and without the 135 MB GIN index or the message column.
+
+Compression ratio depends on data density. The seeded dataset spreads 1M rows
+over 30 days (~23 rows/minute), so it compresses only ~45%. Under real ingestion
+load a single minute holds ~2.6M rows collapsing to 20 rollup rows (5 services ×
+4 levels) — a ratio of roughly 130,000:1 in the regime that actually matters.
+
+Correctness verified: raw count 3,109,775 vs rollup sum 3,109,765 over the same
+7-day window — a 0.0003% difference attributable to the minute boundary between
+the two subqueries.
+
+Rollup table size: 65 MB / 553,523 rows against 167 MB for the raw partitions,
+and without the 135 MB GIN index or the message column.
+
+Compression depends on data density. The seeded dataset spreads 1M rows over 30
+days (~23 rows/minute), so it compresses only ~45%. Under real ingestion load a
+single minute holds ~2.6M rows collapsing to 20 rollup rows (5 services × 4
+levels) — roughly 130,000:1 in the regime that matters.
+
+### Known limitation
+
+The rollup cannot serve every query. Attribute filters and message search are not
+in the grouping key, and the current minute is still receiving rows. Query routing
+is handled in the aggregate endpoint: rollup when the filters allow it, raw table
+otherwise.
