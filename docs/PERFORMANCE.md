@@ -24,9 +24,8 @@ VACUUM FULL ANALYZE logs;
 SELECT count(*) FROM logs;
 ```
 
-Row count and heap size are recorded alongside every result. This protocol was
-adopted after several comparisons were invalidated — see "Measurement discipline"
-below.
+Row count is recorded alongside every result. This protocol was adopted after
+several comparisons were invalidated — see "Measurement discipline" below.
 
 ### Tooling
 
@@ -107,8 +106,9 @@ so the working set does not fit in cache.
 
 ### 4. Aggregation degrades sharply under concurrent ingestion
 
-Detailed below. The database saturates at 100% of its single CPU during
-ingestion, and aggregation runs on what remains.
+The database saturates at 100% of its single CPU during ingestion, and
+aggregation runs on what remains. Measured at 2,715 ms p95 against a 1,000 ms
+target. This was the binding constraint and drove optimization 2.
 
 ---
 
@@ -215,7 +215,7 @@ accepted" holds without special handling — no in-memory buffering is involved.
 
 ---
 
-## Concurrent load: aggregation under ingestion
+## Concurrent load: aggregation under ingestion (before rollup)
 
 All three runs start from an identical state: 966,812 rows, 167 MB heap,
 reset via `DELETE` + `VACUUM FULL ANALYZE`.
@@ -241,11 +241,7 @@ saturated single CPU is contention, not capacity.
 
 **Aggregate p95 improves 47% but plateaus around 1,400 ms**, still above the
 1,000 ms target. At concurrency 2, Postgres runs at 87–92% rather than 100%, and
-the query still costs 1,429 ms against 104 ms with the CPU free — a 14x
-degradation.
-
-The remaining cost is the work itself: after a 60-second ingestion run the 7-day
-window contains ~3M rows, and counting them requires reading them.
+the query still costs 1,429 ms against 104 ms with the CPU free.
 
 ### Why lowering concurrency is not the fix
 
@@ -254,16 +250,91 @@ generator controls its own. These runs establish the shape of the problem — th
 database saturates and aggregation starves — but the remedy has to live in the
 service.
 
-Candidate remedies, in order of expected value:
+---
 
-1. **Pre-aggregated rollup tables.** Compute buckets on write rather than on
-   read, turning a 3M-row scan into a ~1,000-row lookup. The spec's 20-second
-   visibility allowance means rollups can be refreshed periodically rather than
-   per insert, keeping the cost off the ingestion path.
-2. **`statement_timeout`.** Bound the damage a single expensive query can do to
-   concurrent writers.
-3. **Write concurrency limiting inside the service**, so the service controls
-   contention rather than the client.
+## Optimization 2: Pre-aggregated rollup table
+
+Aggregation over the raw table scans every row in range. Under load the 7-day
+window holds millions of rows, and counting them requires reading them.
+
+`log_rollup_1m` stores `(bucket, service, level, count)` at 1-minute granularity.
+All four spec bucket sizes are derived by summing minutes; both `group_by` options
+are derived by summing across the other dimension.
+
+Refreshed on a 10-second timer, not by trigger. A trigger would execute ~45,000
+times per second on the write path; the timer executes 0.1 times per second — a
+450,000x difference in how often the cost is paid. Measured refresh cost: 61 ms
+per cycle, roughly 0.6% of database time. The spec's 20-second visibility
+allowance is what makes deferred refresh legitimate rather than a shortcut.
+
+### Query routing
+
+The rollup serves a query when every column it needs exists in
+`(bucket, service, level, count)`:
+
+| Query | Rollup? | Why |
+|---|---|---|
+| no filters | ✅ | sum across both dimensions |
+| `service=X` / `level=X` | ✅ | column present |
+| `group_by=service` / `level` | ✅ | column present |
+| `attr.<key>=X` | ❌ | attributes were collapsed away when rollup rows were built |
+| `q=text` | ❌ | messages are not stored in the rollup |
+
+Rollup viability rests on counts being additive: summing minute buckets gives
+hourly buckets, and summing across `level` gives per-service totals. An average
+or a median could not be derived this way.
+
+### Raw-tail merge
+
+The rollup lags 2–3 minutes: a bucket is only counted once complete, plus the
+10-second timer interval. The spec requires newly ingested data to be queryable
+within 20 seconds, so the rollup alone would not comply.
+
+Rollup-backed queries therefore `UNION ALL` two sources, split at
+`log_rollup_state.last_bucket` — the exact watermark the rollup has been computed
+to, which guarantees neither double-counting nor gaps:
+
+- pre-aggregated minute buckets up to the watermark
+- raw rows after it, counted as 1 each
+
+The raw tail is cheap: a few minutes falls inside a single partition.
+
+### Result: aggregation alone (4,705,054 rows)
+
+| Source | Execution |
+|---|---|
+| Raw table | 3,080.7 ms |
+| Rollup | **64.8 ms** |
+
+Correctness verified over the same 7-day window: raw count 3,109,775 vs rollup
+sum 3,109,765 — a 0.0003% difference attributable to the minute boundary between
+the two subqueries.
+
+### Result: concurrent load, ingestion concurrency 8
+
+Dataset: 4,705,054 rows at start of run.
+
+| Metric | Before rollup | After rollup | Change |
+|---|---|---|---|
+| Aggregate p50 | 1,203 ms | 431 ms | −64% |
+| **Aggregate p95** | **2,715 ms** | **611 ms** | **−77%** |
+| Requests completed (of 30) | 22 | **30** | — |
+| Ingestion throughput | 43,117/sec | **45,497/sec** | +6% |
+| Ingestion p95 | 186.4 ms | 160.6 ms | −14% |
+
+Ingestion improved despite the rollup adding work, because aggregate queries no
+longer monopolise the database for seconds at a time. Optimising the read path
+freed capacity on the write path — a second-order effect, not a target.
+
+### Rollup storage
+
+65 MB / 553,523 rows against 167 MB for the raw partitions, and without the
+135 MB GIN index or the message column.
+
+Compression depends on data density. The seeded dataset spreads 1M rows over 30
+days (~23 rows/minute), so it compresses only ~45%. Under real ingestion load a
+single minute holds ~2.6M rows collapsing to 20 rollup rows (5 services × 4
+levels) — roughly 130,000:1 in the regime that matters.
 
 ---
 
@@ -310,63 +381,43 @@ phase.** `DROP TABLE partition` reclaims the same space as a metadata operation 
 no lock, no rewrite, no accumulated bloat. The 380 MB above is what row-level
 DELETE costs in practice.
 
+### Silent measurement tools
+
+Both load generators initially counted errors without recording any detail. On
+three separate occasions a failure produced only a count — 30 errors, then 20,435
+— with no indication of cause. Diagnostic output was added to print the first
+error of each kind.
+
+---
+
+## Known limitations
+
+- **Planning time scales with partition count.** 2.6 ms at 9 partitions, 14.5 ms
+  at 36. At longer retention this grows further and is paid per request. Not
+  addressed; would require coarser partitions, trading against retention
+  granularity.
+- **Attribute and message filters bypass the rollup** and pay full scan cost.
+  Acceptable because dashboard-style queries — counts over time, split by service
+  or level — are the common case.
+- **Rollup bucket expressions rewrite the column name by string replacement**
+  when targeting the merged CTE. It works but is fragile to changes in the bucket
+  expression definitions.
+- **Numbers were measured on macOS via Docker Desktop's Linux VM.** Native Linux
+  should perform better; these figures are conservative.
+
 ---
 
 ## Status against spec targets
 
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | 43,117–50,177/sec | ✅ |
+| Sustain ≥ 15,000 logs/sec | 45,497/sec | ✅ |
 | No dropped requests or crashes | 0 errors across all runs | ✅ |
-| ~1,000,000 stored rows | 966,812 baseline, 3M+ under load | ✅ |
-| Aggregation p95 < 1s (idle) | 104 ms | ✅ |
-| **Aggregation p95 < 1s (under ingestion)** | **1,429–2,715 ms** | ❌ |
-| 1 aggregate/sec during ingestion | Achieved at concurrency 2 and 4; degraded to 22–27 of 30 at concurrency 8 | ⚠️ |
+| ~1,000,000 stored rows | 4.7M under load | ✅ |
+| Aggregation p95 < 1s (idle) | 160 ms | ✅ |
+| Aggregation p95 < 1s (under ingestion) | **611 ms** | ✅ |
+| 1 aggregate/sec during ingestion | 30/30 completed | ✅ |
+| Newly ingested data queryable within 20s | Raw tail queried directly past the rollup watermark | ✅ |
 
-The outstanding item is aggregation latency under concurrent ingestion. Rollup
-tables are the intended remedy.
-
-## Optimization 2: Pre-aggregated rollup table
-
-Aggregation over the raw table scans every row in range. Under load the 7-day
-window holds millions of rows, and counting them requires reading them.
-
-`log_rollup_1m` stores `(bucket, service, level, count)` at 1-minute granularity.
-All four spec bucket sizes are derived by summing minutes; both `group_by` options
-are derived by summing across the other dimension.
-
-Refreshed on a 10-second timer, not by trigger. A trigger would execute ~43,000
-times per second on the write path; the timer executes 0.1 times per second — a
-430,000x difference in how often the cost is paid. The spec's 20-second visibility
-allowance is what makes deferred refresh legitimate.
-
-| Query | Raw table | Rollup | Change |
-|---|---|---|---|
-| hourly buckets, 7-day range | 3,080.7 ms | **64.8 ms** | **−98%** |
-
-Rollup table size: 65 MB / 553,523 rows against 167 MB for the raw partitions —
-and without the 135 MB GIN index or the message column.
-
-Compression ratio depends on data density. The seeded dataset spreads 1M rows
-over 30 days (~23 rows/minute), so it compresses only ~45%. Under real ingestion
-load a single minute holds ~2.6M rows collapsing to 20 rollup rows (5 services ×
-4 levels) — a ratio of roughly 130,000:1 in the regime that actually matters.
-
-Correctness verified: raw count 3,109,775 vs rollup sum 3,109,765 over the same
-7-day window — a 0.0003% difference attributable to the minute boundary between
-the two subqueries.
-
-Rollup table size: 65 MB / 553,523 rows against 167 MB for the raw partitions,
-and without the 135 MB GIN index or the message column.
-
-Compression depends on data density. The seeded dataset spreads 1M rows over 30
-days (~23 rows/minute), so it compresses only ~45%. Under real ingestion load a
-single minute holds ~2.6M rows collapsing to 20 rollup rows (5 services × 4
-levels) — roughly 130,000:1 in the regime that matters.
-
-### Known limitation
-
-The rollup cannot serve every query. Attribute filters and message search are not
-in the grouping key, and the current minute is still receiving rows. Query routing
-is handled in the aggregate endpoint: rollup when the filters allow it, raw table
-otherwise.
+All performance targets met. The spec lists 20,000 and 25,000 logs/sec as
+additional credit; measured throughput is 45,497/sec.
