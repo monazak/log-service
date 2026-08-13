@@ -3,6 +3,7 @@ import { ensurePartitions, runMigrations } from "./db/migrate.ts";
 import { startPartitionScheduler } from "./db/partitionScheduler.ts";
 import { createPool, verifyConnection } from "./db/pool.ts";
 import { dropExpiredPartitions, startRetentionScheduler } from "./db/retention.ts";
+import { startRollupScheduler } from "./db/rollup.ts";
 import { markReady } from "./http/readiness.ts";
 import { buildServer } from "./http/server.ts";
 import { registerShutdownHandlers } from "./http/shutdown.ts";
@@ -13,6 +14,7 @@ const app = buildServer(config, pool);
 
 let partitionTimer: NodeJS.Timeout | undefined;
 let retentionTimer: NodeJS.Timeout | undefined;
+let rollupTimer: NodeJS.Timeout | undefined;
 
 app.addHook("onClose", async () => {
   if (partitionTimer !== undefined) {
@@ -20,6 +22,9 @@ app.addHook("onClose", async () => {
   }
   if (retentionTimer !== undefined) {
     clearInterval(partitionTimer);
+  }
+  if (rollupTimer !== undefined) {
+    clearInterval(rollupTimer);
   }
   app.log.warn("Closing database pool");
   await pool.end();
@@ -50,6 +55,7 @@ try {
 
   retentionTimer = startRetentionScheduler(app, pool, config.retentionDays);
   markReady();
+  rollupTimer = startRollupScheduler(app, pool);
   app.log.info("Service is ready to accept traffic");
 } catch (error) {
   app.log.error(error, "Failed to start service");

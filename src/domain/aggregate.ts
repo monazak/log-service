@@ -90,3 +90,16 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
     },
   };
 }
+
+/**
+ * The rollup stores (bucket, service, level, count). A query is servable from
+ * it only when every column it needs exists there.
+ *
+ * Attribute filters and message search are not: both dimensions were collapsed
+ * away when the rollup rows were built, and messages are not stored at all.
+ */
+export function canUseRollup(params: AggregateParams): boolean {
+  const hasAttributeFilter = Object.keys(params.filters.attributes).length > 0;
+
+  return !hasAttributeFilter && params.filters.q === undefined;
+}

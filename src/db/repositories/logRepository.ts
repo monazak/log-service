@@ -1,9 +1,13 @@
 import type pg from "pg";
 import type { AggregateParams } from "../../domain/aggregate.ts";
+import { canUseRollup } from "../../domain/aggregate.ts";
 import type { CursorPosition } from "../../domain/cursor.ts";
 import type { ValidLogEntry } from "../../domain/log.ts";
 import type { LogFilters } from "../../domain/query.ts";
-import { buildAggregateQuery } from "../queries/aggregateQuery.ts";
+import {
+  buildAggregateQuery,
+  buildRollupAggregateQuery,
+} from "../queries/aggregateQuery.ts";
 import { buildWhereClause } from "../queries/whereClause.ts";
 
 /**
@@ -121,7 +125,9 @@ export async function aggregateLogs(
   pool: pg.Pool,
   params: AggregateParams,
 ): Promise<AggregateRow[]> {
-  const query = buildAggregateQuery(params);
+  const query = canUseRollup(params)
+    ? buildRollupAggregateQuery(params)
+    : buildAggregateQuery(params);
   const result = await pool.query<AggregateRow>(query.sql, query.values);
   return result.rows;
 }

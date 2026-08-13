@@ -54,3 +54,74 @@ export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
 
   return { sql, values: where.values };
 }
+
+/**
+ * Builds the rollup-backed aggregation query.
+ *
+ * Combines two sources: pre-aggregated minute buckets for everything up to the
+ * rollup watermark, and raw rows for the minutes after it. The rollup lags by
+ * ~2-3 minutes (a bucket is only counted once complete), while the spec requires
+ * newly ingested data to be queryable within 20 seconds — so the raw tail is
+ * what keeps the endpoint compliant.
+ *
+ * The boundary is `log_rollup_state.last_bucket`, the exact point the rollup has
+ * been computed to, which guarantees neither double-counting nor gaps.
+ */
+export function buildRollupAggregateQuery(params: AggregateParams): AggregateQuery {
+  const values: unknown[] = [];
+
+  const param = (value: unknown): string => {
+    values.push(value);
+    return `$${values.length}`;
+  };
+
+  const bucketExpr = BUCKET_EXPRESSIONS[params.bucket].replace(/"timestamp"/g, "ts");
+
+  const groupExpr =
+    params.groupBy !== undefined ? GROUP_COLUMNS[params.groupBy] : "NULL";
+
+  const conditions: string[] = [];
+
+  if (params.filters.service !== undefined) {
+    conditions.push(`service = ${param(params.filters.service)}`);
+  }
+
+  if (params.filters.level !== undefined) {
+    conditions.push(`level = ${param(params.filters.level)}`);
+  }
+
+  const filterSql = conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : "";
+
+  const since = param(params.since);
+  const until = param(params.until);
+
+  const sql = `
+    WITH watermark AS (
+      SELECT last_bucket FROM log_rollup_state WHERE id
+    ),
+    combined AS (
+      SELECT bucket AS ts, service, level, count AS cnt
+      FROM log_rollup_1m, watermark
+      WHERE bucket >= ${since}
+        AND bucket < LEAST(${until}, watermark.last_bucket)
+        ${filterSql}
+
+      UNION ALL
+
+      SELECT "timestamp" AS ts, service, level, 1::bigint AS cnt
+      FROM logs, watermark
+      WHERE "timestamp" >= GREATEST(${since}, watermark.last_bucket)
+        AND "timestamp" < ${until}
+        ${filterSql}
+    )
+    SELECT
+      ${bucketExpr} AS bucket_start,
+      ${groupExpr} AS grp,
+      sum(cnt)::bigint AS cnt
+    FROM combined
+    GROUP BY bucket_start, grp
+    ORDER BY bucket_start ASC, grp ASC NULLS FIRST
+  `;
+
+  return { sql, values };
+}
