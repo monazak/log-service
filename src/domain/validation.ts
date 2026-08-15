@@ -48,7 +48,13 @@ function validateAttributes(raw: unknown): Attributes | string {
   const result: Record<string, string> = {};
 
   for (const [key, value] of Object.entries(raw)) {
+    if (key.includes("\u0000")) {
+      return "attribute keys must not contain null bytes";
+    }
     if (typeof value === "string") {
+       if (value.includes("\u0000")) {
+        return `attribute '${key}' must not contain null bytes`;
+      }
       result[key] = value;
       continue;
     }
@@ -80,6 +86,9 @@ function validateNonEmptyString(
   }
   if (raw.length === 0) {
     return { error: `${field} must be a non-empty string` };
+  }
+  if (raw.includes("\u0000")) {
+    return { error: `${field} must not contain null bytes` };
   }
   return raw;
 }

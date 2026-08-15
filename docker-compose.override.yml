@@ -8,3 +8,7 @@ services:
       LOG_LEVEL: info
     volumes:
       - ./src:/app/src:ro
+
+  postgres:
+    ports:
+      - "55432:5432"

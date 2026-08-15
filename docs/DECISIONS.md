@@ -418,3 +418,19 @@ become expired, while keeping catalog scans infrequent.
 The cutoff date is computed inside the database from `CURRENT_DATE` rather than
 passed in from Node, so partition boundaries and the retention cutoff share a
 single clock.
+
+## Null bytes in text fields
+
+Rejected at validation with a per-entry reason, not stripped.
+
+Postgres cannot store `\u0000` in a `TEXT` column — its strings are
+NUL-terminated internally — while JSON permits it. Without an explicit check the
+insert fails at the database and the handler returns 500 for the whole batch,
+violating both the error contract and the partial-success requirement that one
+bad entry must not fail the batch.
+
+Rejecting rather than sanitising: the spec does not ask for normalisation, and
+silently altering stored data is a surprising behaviour in a log service. An
+explicit rejection reason tells the sender what to fix.
+
+Found by an integration test, not by inspection.
