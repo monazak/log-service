@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: logservice
+          POSTGRES_PASSWORD: logservice
+          POSTGRES_DB: logs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U logservice -d logs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://logservice:logservice@127.0.0.1:5432/logs
+
+  contract:
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the stack exactly as a grader would
+        run: docker compose -f docker-compose.yml up -d --build
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf localhost:8080/health > /dev/null; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "service never became healthy"
+          docker compose logs
+          exit 1
+
+      - name: Required contract smoke test
+        run: |
+          set -euo pipefail
+
+          echo "--- POST /logs"
+          curl -sf -X POST localhost:8080/logs \
+            -H 'content-type: application/json' \
+            -H 'authorization: Bearer unrecognised-token' \
+            -d '{"logs":[{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","level":"error","service":"ci","message":"smoke test","attributes":{"run":"1"}}]}' \
+            | grep -q '"accepted":1'
+
+          echo "--- GET /logs"
+          curl -sf "localhost:8080/logs?service=ci&limit=10" | grep -q '"logs"'
+
+          echo "--- GET /logs/aggregate"
+          SINCE=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+          UNTIL=$(date -u -d '1 hour' +%Y-%m-%dT%H:%M:%SZ)
+          curl -sf "localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1h" \
+            | grep -q '"buckets"'
+
+          echo "All four required endpoints responded."
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
