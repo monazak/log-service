@@ -1,5 +1,5 @@
 import type { RejectedEntry, ValidLogEntry } from "./log.ts";
-import { validateLogEntry } from "./validations.ts";
+import { validateLogEntry } from "./validation.ts";
 
 /**
  * Validates a batch, keeping valid entries and recording why each invalid one
