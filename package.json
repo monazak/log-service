@@ -20,8 +20,9 @@
     "lint:fix": "biome check --write src",
     "format": "biome format --write src",
     "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
     "test:watch": "vitest",
-    "test:unit": "vitest run tests/unit"
+    "test:db": "TEST_DATABASE_URL=postgres://logservice:logservice@127.0.0.1:55432/logs vitest run"
   },
   "repository": {
     "type": "git",
