@@ -182,6 +182,7 @@ inserts distributed across many, so this figure was optimistic.
 | Latency p99 | 204.5 ms |
 
 Target is 15,000/sec; the spec lists 20,000 and 25,000 as additional credit.
+The final figure after the rollup work is 45,497/sec — see below.
 
 Verified after each run: `logs_default` holds 0 rows, confirming every row was
 routed to its daily partition rather than the fallback.
@@ -279,6 +280,7 @@ The rollup serves a query when every column it needs exists in
 | `group_by=service` / `level` | ✅ | column present |
 | `attr.<key>=X` | ❌ | attributes were collapsed away when rollup rows were built |
 | `q=text` | ❌ | messages are not stored in the rollup |
+| range starting within the last hour | ❌ | see recent-range fallback below |
 
 Rollup viability rests on counts being additive: summing minute buckets gives
 hourly buckets, and summing across `level` gives per-service totals. An average
@@ -291,13 +293,27 @@ The rollup lags 2–3 minutes: a bucket is only counted once complete, plus the
 within 20 seconds, so the rollup alone would not comply.
 
 Rollup-backed queries therefore `UNION ALL` two sources, split at
-`log_rollup_state.last_bucket` — the exact watermark the rollup has been computed
-to, which guarantees neither double-counting nor gaps:
+`log_rollup_state.last_bucket` — the watermark the rollup has been computed to:
 
 - pre-aggregated minute buckets up to the watermark
 - raw rows after it, counted as 1 each
 
 The raw tail is cheap: a few minutes falls inside a single partition.
+
+### Recent-range fallback
+
+The watermark guarantees coverage only for rows that *existed when the rollup last
+ran*. Rows inserted afterwards with older timestamps fall into a gap: the rollup
+does not contain them, and the raw tail starts after them.
+
+Two mitigations. The refresh recomputes a trailing window rather than only
+advancing, so late arrivals within that window are picked up. And ranges beginning
+within the last hour bypass the rollup entirely and read the raw table — recent
+ranges span one or two daily partitions, so scanning them directly is cheap.
+
+Found by an integration test asserting that bucket totals equal ingested row count
+regardless of bucket size. The test returned 8 of 60 rows before the fallback was
+added.
 
 ### Result: aggregation alone (4,705,054 rows)
 
@@ -390,12 +406,34 @@ error of each kind.
 
 ---
 
+## Not measured
+
+Recorded so the gaps are explicit rather than implied.
+
+- **Connection pool size.** Fixed at 8 throughout. Request concurrency was swept
+  instead and showed the same contention shape, but no run compared 4 / 8 / 16 / 32
+  connections directly. The database was the constraint in every run, so the pool
+  was never the suspected bottleneck.
+- **Trigram index cost for `q`.** `pg_trgm` is enabled but no index was created.
+  Load testing did not exercise `q` heavily enough to justify measuring the
+  write-side cost, so no before/after comparison exists.
+- **Batch size sensitivity.** All runs used batches of 500. Smaller batches shift
+  cost toward HTTP overhead and larger ones toward memory pressure, but the curve
+  was not mapped.
+
+---
+
 ## Known limitations
 
 - **Planning time scales with partition count.** 2.6 ms at 9 partitions, 14.5 ms
   at 36. At longer retention this grows further and is paid per request. Not
   addressed; would require coarser partitions, trading against retention
   granularity.
+- **Rows arriving with timestamps older than the rollup's trailing window are
+  missed by the rollup.** Recent-range queries fall back to the raw table so
+  results stay correct, but late-arriving historical data does not benefit from
+  pre-aggregation. A general fix requires tracking insertion order separately from
+  event time.
 - **Attribute and message filters bypass the rollup** and pay full scan cost.
   Acceptable because dashboard-style queries — counts over time, split by service
   or level — are the common case.
@@ -417,7 +455,7 @@ error of each kind.
 | Aggregation p95 < 1s (idle) | 160 ms | ✅ |
 | Aggregation p95 < 1s (under ingestion) | **611 ms** | ✅ |
 | 1 aggregate/sec during ingestion | 30/30 completed | ✅ |
-| Newly ingested data queryable within 20s | Raw tail queried directly past the rollup watermark | ✅ |
+| Newly ingested data queryable within 20s | Recent ranges read the raw table directly | ✅ |
 
 All performance targets met. The spec lists 20,000 and 25,000 logs/sec as
 additional credit; measured throughput is 45,497/sec.
