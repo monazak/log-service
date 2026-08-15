@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createHarness, logEntry, testService, type Harness } from "./helpers.ts";
+import { createHarness, testService, type Harness } from "./helpers.ts";
 
 let h: Harness;
 const SERVICE = testService("query");
