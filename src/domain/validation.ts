@@ -52,7 +52,7 @@ function validateAttributes(raw: unknown): Attributes | string {
       return "attribute keys must not contain null bytes";
     }
     if (typeof value === "string") {
-       if (value.includes("\u0000")) {
+      if (value.includes("\u0000")) {
         return `attribute '${key}' must not contain null bytes`;
       }
       result[key] = value;

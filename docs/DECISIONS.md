@@ -434,3 +434,24 @@ silently altering stored data is a surprising behaviour in a log service. An
 explicit rejection reason tells the sender what to fix.
 
 Found by an integration test, not by inspection.
+
+## Rollup coverage gap (found by integration test)
+
+The original merge assumed `last_bucket` meant "everything before this is
+rolled up". It does not: it means "everything that existed when the rollup last
+ran". Rows inserted afterwards with older timestamps were covered by neither
+branch — the rollup did not contain them, and the raw tail started at the
+watermark.
+
+Two fixes: the refresh now recomputes a trailing window rather than only
+advancing, and `canUseRollup` returns false for ranges beginning within the last
+hour, so recent queries read the raw table directly. Recent ranges are cheap to
+scan — they fall inside one or two daily partitions — so the fallback costs
+little.
+
+Known limitation: rows arriving with timestamps older than the trailing window
+are still missed by the rollup. A correct general fix requires tracking
+insertion order separately from event time.
+
+Found by an integration test asserting that bucket totals equal ingested row
+count regardless of bucket size.

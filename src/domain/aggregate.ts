@@ -19,6 +19,8 @@ export type BucketSize = (typeof BUCKET_SIZES)[number];
 export const GROUP_BY_FIELDS = ["service", "level"] as const;
 export type GroupByField = (typeof GROUP_BY_FIELDS)[number];
 
+const RECENT_WINDOW_MS = 60 * 60 * 1000;
+
 export interface AggregateParams {
   readonly filters: LogFilters;
   readonly since: Date;
@@ -62,7 +64,7 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
   if (!isBucketSize(rawBucket)) {
     return {
       ok: false,
-      error: `invalid ucket: '${rawBucket}, expected one of ${BUCKET_SIZES.join(", ")} `,
+      error: `invalid bucket: '${rawBucket}', expected one of ${BUCKET_SIZES.join(", ")}`,
     };
   }
 
@@ -98,8 +100,15 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
  * Attribute filters and message search are not: both dimensions were collapsed
  * away when the rollup rows were built, and messages are not stored at all.
  */
-export function canUseRollup(params: AggregateParams): boolean {
+export function canUseRollup(
+  params: AggregateParams,
+  now: number = Date.now(),
+): boolean {
   const hasAttributeFilter = Object.keys(params.filters.attributes).length > 0;
 
-  return !hasAttributeFilter && params.filters.q === undefined;
+  if (hasAttributeFilter || params.filters.q !== undefined) {
+    return false;
+  }
+
+  return now - params.since.getTime() >= RECENT_WINDOW_MS;
 }
