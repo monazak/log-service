@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
-import type { LogBatcher } from "../../db/batcher.ts";
+import { type LogBatcher, QueueFullError } from "../../db/batcher.ts";
 import { aggregateLogs, queryLogs } from "../../db/repositories/logRepository.ts";
 import { parseAggregateParams } from "../../domain/aggregate.ts";
 import { validateBatch } from "../../domain/batch.ts";
@@ -43,7 +43,20 @@ export function registerLogRoutes(
       return reply.status(400).send({ accepted: 0, rejected });
     }
 
-    await batcher.submit(valid);
+    try {
+      await batcher.submit(valid);
+    } catch (error) {
+      // Shedding load beats crashing, and the spec forbids acknowledging a
+      // batch that was not written. 503 with Retry-After tells the client this
+      // is transient and safe to retry.
+      if (error instanceof QueueFullError) {
+        return reply
+          .code(503)
+          .header("retry-after", "1")
+          .send({ error: "ingestion queue is full, retry shortly" });
+      }
+      throw error;
+    }
 
     return reply.code(200).send({
       accepted: valid.length,
