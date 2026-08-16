@@ -494,3 +494,19 @@ by the feedback loop, recorded rather than hidden.
 Micro-batching was planned from the start — the repository boundary existed for
 exactly this swap — but was not implemented until measurement showed per-request
 round trips were the constraint.
+
+### GIN index removed after load testing
+
+Dropped in migration 008. Under the graded load generator, Postgres saturated
+its single CPU at ~1,100 logs/sec while the application container sat at 21% of
+its allowance — index maintenance was the dominant write cost, and this index
+accounted for 59% of total index size (135 MB of 229 MB at 1M rows).
+
+Trade-off accepted: `attr.<key>` filters are now sequential scans. Partition
+pruning still bounds the scan to the queried time range, so time-filtered
+attribute queries remain usable; unfiltered ones degrade with retention depth.
+
+This inverts the original reasoning, which optimised one filter at the cost of
+write throughput. The spec weights ingestion far more heavily, and measurement
+showed the cost was real rather than theoretical. Verified: all 88 tests still
+pass, including attribute filter correctness.
