@@ -99,6 +99,13 @@ optimisation after that point was measured rather than guessed.
   cross that boundary, so these numbers are expected to be lower than the same
   stack on native Linux.
 
+Container limits verified as applied, not merely declared:
+
+```
+docker inspect log-service-app-1 --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'
+→ 500000000 268435456    (0.5 CPU, 256 MB)
+```
+
 ### Measurement protocol
 
 Every run is preceded by a reset:
