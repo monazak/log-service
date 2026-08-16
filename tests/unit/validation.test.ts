@@ -109,6 +109,19 @@ describe("validateLogEntry", () => {
         id: "42",
       });
     });
+    
+    it("preserves __proto__ as an ordinary attribute key", () => {
+      const result = validateLogEntry(
+        entry({ attributes: { __proto__: "sentinel" } }),
+        NOW,
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(JSON.parse(JSON.stringify(result.entry.attributes))).toEqual({
+          __proto__: "sentinel",
+        });
+      }
+    });
 
     it("rejects nested objects", () => {
       const result = validateLogEntry(
