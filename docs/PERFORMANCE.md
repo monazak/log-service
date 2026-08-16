@@ -459,3 +459,38 @@ Recorded so the gaps are explicit rather than implied.
 
 All performance targets met. The spec lists 20,000 and 25,000 logs/sec as
 additional credit; measured throughput is 45,497/sec.
+
+## Official load generator results
+
+The graded harness sends much smaller batches than the local generator: 4,800
+requests carrying 132,200 logs — about 27 entries each, against 500 locally.
+That difference inverted the bottleneck.
+
+| Metric | Local (batch 500) | Official (batch ~27) |
+|---|---|---|
+| Throughput | 45,497/sec | 1,101/sec |
+| App CPU | 25–29% of 0.5 | 21% of 0.5 |
+| Postgres CPU | 100% | 101% |
+| Read-after-write success | not measured | 0.08% |
+
+With 500-row batches, per-request overhead amortises across the batch. With 27,
+the fixed cost of connection acquisition, round trip, and commit dominates — the
+INSERT itself is trivial. Local measurement never exposed this because batch size
+was never varied, a gap recorded under "Not measured" before the official run.
+
+### Changes applied
+
+Because the official harness takes ~12 hours to return a result, the three
+changes below were applied together rather than measured individually. Their
+relative contribution is therefore unknown — a methodological compromise forced
+by the feedback loop, recorded rather than hidden.
+
+| Change | Rationale |
+|---|---|
+| `DB_POOL_SIZE` 8 → 20 | ~40 concurrent requests against 8 connections meant most were queued. Pool size should scale with query duration, not core count alone; these queries are very short. |
+| `synchronous_commit=off` | Removes an fsync wait per commit. Postgres still accepts the transaction and rows are immediately visible; only an unclean server crash could lose the last fraction of a second. |
+| Micro-batching | Entries from concurrent requests accumulate for up to 5 ms and are written in one INSERT. Each request's promise resolves only after that INSERT commits, so no batch is acknowledged before Postgres accepts it. |
+
+Micro-batching was planned from the start — the repository boundary existed for
+exactly this swap — but was not implemented until measurement showed per-request
+round trips were the constraint.
