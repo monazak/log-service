@@ -56,43 +56,95 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No env file, no arguments, no manual setup — the spec's stated
+      # zero-configuration contract, tested rather than asserted.
       - name: Start the stack exactly as a grader would
         run: docker compose -f docker-compose.yml up -d --build
 
       - name: Wait for readiness
         run: |
+          set -euo pipefail
           for i in $(seq 1 60); do
-            if curl -sf localhost:8080/health > /dev/null; then
+            if curl -sf --max-time 5 localhost:8080/health > /dev/null; then
               echo "ready after ${i}s"
               exit 0
             fi
             sleep 1
           done
-          echo "service never became healthy"
-          docker compose logs
+          echo "service never became healthy within 60s"
           exit 1
 
+      # The load generator always sends an Authorization header. With auth
+      # disabled it must be ignored, not rejected — so every request below
+      # carries one.
       - name: Required contract smoke test
         run: |
           set -euo pipefail
-
-          echo "--- POST /logs"
-          curl -sf -X POST localhost:8080/logs \
-            -H 'content-type: application/json' \
-            -H 'authorization: Bearer unrecognised-token' \
-            -d '{"logs":[{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","level":"error","service":"ci","message":"smoke test","attributes":{"run":"1"}}]}' \
-            | grep -q '"accepted":1'
-
-          echo "--- GET /logs"
-          curl -sf "localhost:8080/logs?service=ci&limit=10" | grep -q '"logs"'
-
-          echo "--- GET /logs/aggregate"
+          AUTH='authorization: Bearer unrecognised-token'
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           SINCE=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
           UNTIL=$(date -u -d '1 hour' +%Y-%m-%dT%H:%M:%SZ)
-          curl -sf "localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1h" \
+
+          echo "--- GET /health"
+          curl -sf --max-time 5 -H "$AUTH" localhost:8080/health > /dev/null
+
+          echo "--- POST /logs"
+          curl -sf --max-time 10 -X POST localhost:8080/logs \
+            -H 'content-type: application/json' -H "$AUTH" \
+            -d '{"logs":[{"timestamp":"'"$NOW"'","level":"error","service":"ci","message":"smoke test","attributes":{"run":"1"}}]}' \
+            | grep -q '"accepted":1'
+
+          echo "--- POST /logs, partial batch"
+          curl -sf --max-time 10 -X POST localhost:8080/logs \
+            -H 'content-type: application/json' -H "$AUTH" \
+            -d '{"logs":[{"timestamp":"'"$NOW"'","level":"info","service":"ci","message":"ok"},{"timestamp":"'"$NOW"'","level":"critical","service":"ci","message":"bad"}]}' \
+            | grep -q '"index":1'
+
+          echo "--- GET /logs"
+          curl -sf --max-time 10 -H "$AUTH" \
+            "localhost:8080/logs?service=ci&limit=10" | grep -q '"next_cursor"'
+
+          echo "--- GET /logs/aggregate"
+          curl -sf --max-time 10 -H "$AUTH" \
+            "localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1h" \
             | grep -q '"buckets"'
 
           echo "All four required endpoints responded."
+
+      # Error contract: the spec is explicit that these return 400 with an
+      # {"error": ...} body. A service that 500s or 200s here fails the contract.
+      - name: Error contract
+        run: |
+          set -euo pipefail
+          AUTH='authorization: Bearer unrecognised-token'
+
+          expect_400() {
+            local label="$1"; shift
+            local code
+            code=$(curl -s --max-time 10 -o /tmp/body -w '%{http_code}' "$@")
+            if [ "$code" != "400" ]; then
+              echo "$label: expected 400, got $code"
+              cat /tmp/body
+              exit 1
+            fi
+            grep -q '"error"' /tmp/body || { echo "$label: no error field"; exit 1; }
+            echo "$label: 400 as expected"
+          }
+
+          expect_400 "malformed JSON" -X POST localhost:8080/logs \
+            -H 'content-type: application/json' -H "$AUTH" -d '{"logs":['
+
+          expect_400 "invalid limit" -H "$AUTH" \
+            "localhost:8080/logs?limit=abc"
+
+          expect_400 "until before since" -H "$AUTH" \
+            "localhost:8080/logs?since=2026-08-10T00:00:00Z&until=2026-08-09T00:00:00Z"
+
+          expect_400 "malformed cursor" -H "$AUTH" \
+            "localhost:8080/logs?cursor=garbage"
+
+          expect_400 "missing bucket" -H "$AUTH" \
+            "localhost:8080/logs/aggregate?since=2026-08-10T00:00:00Z&until=2026-08-11T00:00:00Z"
 
       - name: Show logs on failure
         if: failure()
