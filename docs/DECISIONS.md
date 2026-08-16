@@ -731,6 +731,30 @@ regardless of bucket size.
 
 ---
 
+## Unlogged tables and watermark loss
+
+Making the rollup tables UNLOGGED removed their WAL cost, but Postgres truncates
+unlogged tables after an unclean shutdown — and `log_rollup_state` holds a single
+row that the entire rollup path depends on.
+
+Two failure modes followed, neither of which raised an error:
+
+The aggregate query joins its CTE against that row. A `CROSS JOIN` with zero rows
+yields zero rows, so every rollup-routed aggregate would return `{"buckets": []}`
+— an empty result with a 200 status.
+
+The refresh function read the watermark with `SELECT` and wrote it with `UPDATE`,
+both no-ops on an empty table. The watermark would never be restored, so the
+condition was permanent rather than transient.
+
+Fixed in two places. The query coalesces a missing watermark to `-infinity`, which
+sends the whole range down the raw-table branch — slower but correct. The refresh
+coalesces on read and upserts on write, so the row returns on the next cycle.
+
+Found by deliberately truncating the table and querying, not by inspection. The
+lesson generalises: making a table UNLOGGED is not free just because its contents
+are derived — anything reading it must handle its absence.
+
 ## Retention
 
 `RETENTION_DAYS` defaults to 30. The spec states the test dataset represents
