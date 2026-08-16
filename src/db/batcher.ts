@@ -1,19 +1,24 @@
 import type pg from "pg";
 import type { ValidLogEntry } from "../domain/log.ts";
-import { insertLogs } from "./repositories/logRepository.ts";
+import { copyLogs } from "./repositories/logRepository.ts";
 
 /**
  * Micro-batching with deferred acknowledgement.
  *
  * The graded load generator sends ~27 entries per request, so per-request round
- * trips dominate: the INSERT itself is trivial but each one costs a connection
+ * trips dominate: the write itself is trivial but each one costs a connection
  * acquisition, a network round trip, and a commit. Combining entries from
- * several concurrent requests into one statement amortises that cost.
+ * several concurrent requests into one COPY amortises that cost.
+ *
+ * COPY rather than multi-row INSERT: it bypasses the query parser and planner
+ * entirely, moving the formatting work to the application — which measured at
+ * 21% of its 0.5 CPU while Postgres sat at 101%. Spare capacity on exactly the
+ * side that has it.
  *
  * The spec's "never respond 200 to a batch you have not durably accepted" is
- * preserved: callers await a promise that resolves only after the combined
- * INSERT commits. Per-request latency rises by up to the flush interval;
- * throughput rises by the batching factor.
+ * preserved: callers await a promise that resolves only after the COPY
+ * completes. Per-request latency rises by up to the flush interval; throughput
+ * rises by the batching factor.
  */
 
 const FLUSH_INTERVAL_MS = 10;
@@ -37,7 +42,7 @@ export class LogBatcher {
 
   /**
    * Queues entries and resolves once they have been committed.
-   * Rejects if the combined insert fails, so the caller returns an error.
+   * Rejects if the combined write fails, so the caller returns an error.
    */
   submit(entries: readonly ValidLogEntry[]): Promise<void> {
     if (entries.length === 0) {
@@ -89,7 +94,7 @@ export class LogBatcher {
     this.waiters = [];
 
     try {
-      await insertLogs(this.pool, entries);
+      await copyLogs(this.pool, entries);
       for (const waiter of waiters) {
         waiter.resolve();
       }

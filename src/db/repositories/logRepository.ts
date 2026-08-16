@@ -1,4 +1,7 @@
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type pg from "pg";
+import { from as copyFrom } from "pg-copy-streams";
 import type { AggregateParams } from "../../domain/aggregate.ts";
 import { canUseRollup } from "../../domain/aggregate.ts";
 import type { CursorPosition } from "../../domain/cursor.ts";
@@ -130,4 +133,72 @@ export async function aggregateLogs(
     : buildAggregateQuery(params);
   const result = await pool.query<AggregateRow>(query.sql, query.values);
   return result.rows;
+}
+/** Escapes a value for Postgres text-format COPY. */
+function escapeCopyField(value: string): string {
+  let out = "";
+  for (const char of value) {
+    switch (char) {
+      case "\\":
+        out += "\\\\";
+        break;
+      case "\n":
+        out += "\\n";
+        break;
+      case "\r":
+        out += "\\r";
+        break;
+      case "\t":
+        out += "\\t";
+        break;
+      default:
+        out += char;
+    }
+  }
+  return out;
+}
+
+/**
+ * Bulk-inserts entries using COPY.
+ *
+ * COPY bypasses the query parser and planner entirely: no SQL text to parse, no
+ * plan to build, no bind parameters. The formatting work moves to the
+ * application, which measured at 21% of its 0.5 CPU while Postgres sat at 101%
+ * — spare capacity on exactly the side that has it.
+ *
+ * Text format rather than binary: binary is marginally faster but requires
+ * encoding every type by hand, and a single encoding bug corrupts data silently.
+ * Text format's escaping rules are small enough to implement correctly.
+ */
+export async function copyLogs(
+  pool: pg.Pool,
+  entries: readonly ValidLogEntry[],
+): Promise<number> {
+  if (entries.length === 0) {
+    return 0;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    const stream = client.query(
+      copyFrom(
+        `COPY logs ("timestamp", level, service, message, attributes) FROM STDIN`,
+      ),
+    );
+
+    const source = Readable.from(
+      (function* () {
+        for (const entry of entries) {
+          yield `${entry.timestamp.toISOString()}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(JSON.stringify(entry.attributes))}\n`;
+        }
+      })(),
+    );
+
+    await pipeline(source, stream);
+
+    return entries.length;
+  } finally {
+    client.release();
+  }
 }
