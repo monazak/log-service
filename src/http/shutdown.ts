@@ -7,9 +7,12 @@ const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT"] as const;
  * Stops the server without dropping in-flight requests.
  *
  * Docker sends SIGTERM and waits before killing the process. That window is
- * used to stop accepting new connections, finish requests already in progress,
- * and (from Phase 9 onward) flush any buffered rows that have not yet been
- * written to PostgreSQL.
+ * used to stop reporting healthy, finish requests already in progress, and
+ * drain batched rows that have not yet reached PostgreSQL. The onClose hook in
+ * index.ts performs the draining, in that order.
+ *
+ * The force-exit timer is set below `stop_grace_period` in compose, so a hung
+ * shutdown ends on our terms with a log line rather than being killed silently.
  */
 
 export function registerShutdownHandlers(
@@ -23,8 +26,11 @@ export function registerShutdownHandlers(
       return;
     }
     shuttingDown = true;
+
     app.log.warn({ signal }, "Shutdown signal received, closing gracefully");
-    // Stop reporting healthy so load balancers stop sending new traffic.
+
+    // Stop reporting healthy first so load balancers and the load generator
+    // stop routing new traffic while in-flight requests finish.
     markNotReady();
 
     const forceExit = setTimeout(() => {
