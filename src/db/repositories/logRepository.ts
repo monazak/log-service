@@ -16,13 +16,13 @@ import { buildWhereClause } from "../queries/whereClause.ts";
 /**
  * Persistence for log entries.
  *
- * Uses a single multi-row INSERT per batch rather than one statement per entry:
- * each round trip to Postgres costs more than the insert itself, so batching
- * turns N round trips into one.
+ * Writes go through `copyLogs`. `insertLogs` is the earlier multi-row INSERT
+ * implementation, retained because it is the fallback if COPY ever proves
+ * problematic and because the comparison between them is part of the
+ * performance story. It is not on the hot path.
  *
- * This is the correct-but-unoptimized version. The performance phase will
- * measure it against COPY and replace the implementation if warranted — the
- * function signature is the boundary that makes that swap invisible to callers.
+ * Reads are unbatched: `queryLogs` and `aggregateLogs` each issue one
+ * statement. Only writes benefit from amortising the round trip.
  */
 
 /** Postgres caps a statement at 65535 parameters; 5 columns means 13107 rows. */
@@ -44,118 +44,26 @@ export interface AggregateRow {
   readonly cnt: string;
 }
 
-export async function insertLogs(
-  pool: pg.Pool,
-  entries: readonly ValidLogEntry[],
-): Promise<number> {
-  if (entries.length === 0) {
-    return 0;
-  }
-  let inserted = 0;
+/**
+ * Escapes a value for Postgres text-format COPY.
+ *
+ * Text-format COPY delimits fields with tabs and rows with newlines, so an
+ * unescaped message containing either would shift data into the wrong column or
+ * split one row into several — with no error raised. Backslash is escaped
+ * first, or the escapes introduced below would themselves be escaped.
+ *
+ * Null bytes need no handling here: validation rejects them, because Postgres
+ * cannot store them in a TEXT column at all.
+ */
+const COPY_ESCAPES: Record<string, string> = {
+  "\\": "\\\\",
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+};
 
-  for (let start = 0; start < entries.length; start += MAX_ROWS_PER_STATEMENT) {
-    const chunk = entries.slice(start, start + MAX_ROWS_PER_STATEMENT);
-    inserted += await insertChunk(pool, chunk);
-  }
-  return inserted;
-}
-
-async function insertChunk(
-  pool: pg.Pool,
-  entries: readonly ValidLogEntry[],
-): Promise<number> {
-  const values: unknown[] = [];
-  const placeholders: string[] = [];
-
-  for (let i = 0; i < entries.length; i += 1) {
-    const entry = entries[i];
-    if (entry === undefined) {
-      continue;
-    }
-    const base = i * 5;
-    placeholders.push(
-      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`,
-    );
-    values.push(
-      entry.timestamp,
-      entry.level,
-      entry.service,
-      entry.message,
-      JSON.stringify(entry.attributes),
-    );
-  }
-  if (placeholders.length === 0) {
-    return 0;
-  }
-
-  const sql = `
-        INSERT INTO logs ("timestamp", level, service, message, attributes)
-        VALUES ${placeholders.join(", ")}
-    `;
-
-  const result = await pool.query(sql, values);
-
-  return result.rowCount ?? 0;
-}
-
-export async function queryLogs(
-  pool: pg.Pool,
-  filters: LogFilters,
-  cursor?: CursorPosition,
-): Promise<{ rows: LogRow[]; hasMore: boolean }> {
-  const where = buildWhereClause(filters, cursor);
-
-  const sql = `
-    SELECT id, "timestamp", level, service, message, attributes
-    FROM logs
-    ${where.sql}
-    ORDER BY "timestamp" DESC, id DESC
-    LIMIT $${where.values.length + 1}
-  `;
-
-  const values = [...where.values, filters.limit + 1];
-
-  const result = await pool.query<LogRow>(sql, values);
-
-  const hasMore = result.rows.length > filters.limit;
-
-  const rows = hasMore ? result.rows.slice(0, filters.limit) : result.rows;
-
-  return { rows, hasMore };
-}
-
-export async function aggregateLogs(
-  pool: pg.Pool,
-  params: AggregateParams,
-): Promise<AggregateRow[]> {
-  const query = canUseRollup(params)
-    ? buildRollupAggregateQuery(params)
-    : buildAggregateQuery(params);
-  const result = await pool.query<AggregateRow>(query.sql, query.values);
-  return result.rows;
-}
-/** Escapes a value for Postgres text-format COPY. */
 function escapeCopyField(value: string): string {
-  let out = "";
-  for (const char of value) {
-    switch (char) {
-      case "\\":
-        out += "\\\\";
-        break;
-      case "\n":
-        out += "\\n";
-        break;
-      case "\r":
-        out += "\\r";
-        break;
-      case "\t":
-        out += "\\t";
-        break;
-      default:
-        out += char;
-    }
-  }
-  return out;
+  return value.replace(/[\\\n\r\t]/g, (char) => COPY_ESCAPES[char] ?? char);
 }
 
 /**
@@ -164,11 +72,15 @@ function escapeCopyField(value: string): string {
  * COPY bypasses the query parser and planner entirely: no SQL text to parse, no
  * plan to build, no bind parameters. The formatting work moves to the
  * application, which measured at 21% of its 0.5 CPU while Postgres sat at 101%
- * — spare capacity on exactly the side that has it.
+ * — spare capacity on exactly the side that had none.
  *
  * Text format rather than binary: binary is marginally faster but requires
- * encoding every type by hand, and a single encoding bug corrupts data silently.
- * Text format's escaping rules are small enough to implement correctly.
+ * encoding every type by hand, and a single encoding bug corrupts data
+ * silently. Text format's escaping rules are small enough to implement
+ * correctly and verify by test.
+ *
+ * Rows stream from a generator rather than a concatenated string so a 5000-row
+ * batch never materialises whole in a 256 MB process.
  */
 export async function copyLogs(
   pool: pg.Pool,
@@ -196,9 +108,117 @@ export async function copyLogs(
     );
 
     await pipeline(source, stream);
+    client.release();
 
     return entries.length;
-  } finally {
-    client.release();
+  } catch (error) {
+    // Destroy rather than return: a connection abandoned mid-COPY is left in a
+    // protocol state the next borrower cannot recover from.
+    client.release(error as Error);
+    throw error;
   }
+}
+
+/**
+ * Multi-row INSERT. Superseded by copyLogs on the ingestion path.
+ *
+ * Kept as a reference implementation and fallback. Chunking exists because a
+ * single statement is capped at 65535 bind parameters, and because an oversized
+ * statement holds a large parameter array and query string in memory.
+ */
+export async function insertLogs(
+  pool: pg.Pool,
+  entries: readonly ValidLogEntry[],
+): Promise<number> {
+  if (entries.length === 0) {
+    return 0;
+  }
+
+  let inserted = 0;
+
+  for (let start = 0; start < entries.length; start += MAX_ROWS_PER_STATEMENT) {
+    const chunk = entries.slice(start, start + MAX_ROWS_PER_STATEMENT);
+    inserted += await insertChunk(pool, chunk);
+  }
+
+  return inserted;
+}
+
+async function insertChunk(
+  pool: pg.Pool,
+  entries: readonly ValidLogEntry[],
+): Promise<number> {
+  const values: unknown[] = [];
+  const placeholders: string[] = [];
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    if (entry === undefined) {
+      continue;
+    }
+
+    const base = i * 5;
+    placeholders.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`,
+    );
+    values.push(
+      entry.timestamp,
+      entry.level,
+      entry.service,
+      entry.message,
+      JSON.stringify(entry.attributes),
+    );
+  }
+
+  if (placeholders.length === 0) {
+    return 0;
+  }
+
+  const sql = `
+    INSERT INTO logs ("timestamp", level, service, message, attributes)
+    VALUES ${placeholders.join(", ")}
+  `;
+
+  const result = await pool.query(sql, values);
+
+  return result.rowCount ?? 0;
+}
+
+export async function queryLogs(
+  pool: pg.Pool,
+  filters: LogFilters,
+  cursor?: CursorPosition,
+): Promise<{ rows: LogRow[]; hasMore: boolean }> {
+  const where = buildWhereClause(filters, cursor);
+
+  // limit + 1 detects whether another page exists without a second COUNT query.
+  const sql = `
+    SELECT id, "timestamp", level, service, message, attributes
+    FROM logs
+    ${where.sql}
+    ORDER BY "timestamp" DESC, id DESC
+    LIMIT $${where.values.length + 1}
+  `;
+
+  const values = [...where.values, filters.limit + 1];
+
+  const result = await pool.query<LogRow>(sql, values);
+
+  const hasMore = result.rows.length > filters.limit;
+  const rows = hasMore ? result.rows.slice(0, filters.limit) : result.rows;
+
+  return { rows, hasMore };
+}
+
+export async function aggregateLogs(
+  pool: pg.Pool,
+  params: AggregateParams,
+): Promise<AggregateRow[]> {
+  const query = canUseRollup(params)
+    ? buildRollupAggregateQuery(params)
+    : buildAggregateQuery(params);
+
+  const result = await pool.query<AggregateRow>(query.sql, query.values);
+
+  return result.rows;
 }
