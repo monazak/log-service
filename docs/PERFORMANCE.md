@@ -510,3 +510,10 @@ This inverts the original reasoning, which optimised one filter at the cost of
 write throughput. The spec weights ingestion far more heavily, and measurement
 showed the cost was real rather than theoretical. Verified: all 88 tests still
 pass, including attribute filter correctness.
+
+- **The rollup only recomputes a trailing 10-minute window.** Data older than
+  that is covered only if a refresh ran while it was current. Discovered when
+  narrowing the raw-table fallback from one hour to two minutes: aggregate
+  totals dropped from 60 to 26, because queries began routing to a rollup that
+  did not cover the full range. After a restart, or for backfilled data, older
+  buckets are missing and queries covering them undercount.
