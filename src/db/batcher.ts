@@ -16,8 +16,8 @@ import { insertLogs } from "./repositories/logRepository.ts";
  * throughput rises by the batching factor.
  */
 
-const FLUSH_INTERVAL_MS = 5;
-const MAX_BATCH_ENTRIES = 2000;
+const FLUSH_INTERVAL_MS = 10;
+const MAX_BATCH_ENTRIES = 5000;
 
 interface Waiter {
   readonly resolve: () => void;
@@ -29,8 +29,11 @@ export class LogBatcher {
   private waiters: Waiter[] = [];
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
+  private readonly pool: pg.Pool;
 
-  constructor(private readonly pool: pg.Pool) {}
+  constructor(pool: pg.Pool) {
+    this.pool = pool;
+  }
 
   /**
    * Queues entries and resolves once they have been committed.

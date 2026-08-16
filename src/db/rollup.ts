@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 
-const INTERVAL_MS = 10_1000;
+const INTERVAL_MS = 3_000;
 
 /**
  * Rollup maintenance.

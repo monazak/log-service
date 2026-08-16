@@ -13,15 +13,19 @@ interface Bucket {
 beforeAll(async () => {
   h = await createHarness();
 
-  const base = Date.now() - 50 * 60_000;   
+  // Data spans 6 minutes, inside the rollup's 10-minute recompute window.
+  const base = Date.now() - 8 * 60_000;
   const logs = Array.from({ length: 60 }, (_, i) => ({
-    timestamp: new Date(base + i * 45_000).toISOString(),
+    timestamp: new Date(base + i * 6_000).toISOString(),
     level: i % 4 === 0 ? "error" : "info",
     service: SERVICE,
     message: `aggregate test ${i}`,
     attributes: { region: i % 2 === 0 ? "eu-west" : "us-east" },
   }));
+
   await h.app.inject({ method: "POST", url: "/logs", payload: { logs } });
+
+  // Force a refresh so the test does not depend on the timer.
   await h.pool.query("SELECT refresh_log_rollup()");
 });
 
@@ -33,11 +37,11 @@ afterAll(async () => {
 
 function range(): string {
   const until = new Date(Date.now() + 60_000).toISOString();
-  const since = new Date(Date.now() - 55 * 60_000).toISOString();
+  const since = new Date(Date.now() - 10 * 60_000).toISOString();
   return `since=${since}&until=${until}`;
 }
 
-async function aggregate(extra: string) {
+function aggregate(extra: string) {
   return h.app.inject({
     method: "GET",
     url: `/logs/aggregate?${range()}&service=${SERVICE}&${extra}`,

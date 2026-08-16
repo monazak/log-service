@@ -19,7 +19,7 @@ export type BucketSize = (typeof BUCKET_SIZES)[number];
 export const GROUP_BY_FIELDS = ["service", "level"] as const;
 export type GroupByField = (typeof GROUP_BY_FIELDS)[number];
 
-const RECENT_WINDOW_MS = 60 * 60 * 1000;
+const RECENT_WINDOW_MS = 2 * 60 * 1000;
 
 export interface AggregateParams {
   readonly filters: LogFilters;

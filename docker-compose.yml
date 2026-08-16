@@ -29,6 +29,10 @@ services:
       - "max_wal_size=2GB"
       - "-c"
       - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "statement_timeout=10s"
+      - "-c"
+      - "effective_io_concurrency=200"
     environment:
       POSTGRES_USER: logservice
       POSTGRES_PASSWORD: logservice
