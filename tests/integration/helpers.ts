@@ -5,6 +5,7 @@ import { createPool } from "../../src/db/pool.ts";
 import { runMigrations, ensurePartitions } from "../../src/db/migrate.ts";
 import { buildServer } from "../../src/http/server.ts";
 import { markReady } from "../../src/http/readiness.ts";
+import { LogBatcher } from "../../src/db/batcher.ts";
 
 /**
  * Integration test harness.
@@ -37,7 +38,8 @@ export async function createHarness(): Promise<Harness> {
   });
 
   const pool = createPool(config);
-  const app = buildServer(config, pool);
+  const batcher = new LogBatcher(pool);
+  const app = buildServer(config, pool, batcher);
 
   await runMigrations(pool);
   await ensurePartitions(pool);

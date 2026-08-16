@@ -1,4 +1,5 @@
 import { loadConfig } from "./config/env.ts";
+import { LogBatcher } from "./db/batcher.ts";
 import { ensurePartitions, runMigrations } from "./db/migrate.ts";
 import { startPartitionScheduler } from "./db/partitionScheduler.ts";
 import { createPool, verifyConnection } from "./db/pool.ts";
@@ -10,7 +11,8 @@ import { registerShutdownHandlers } from "./http/shutdown.ts";
 
 const config = loadConfig();
 const pool = createPool(config);
-const app = buildServer(config, pool);
+const batcher = new LogBatcher(pool);
+const app = buildServer(config, pool, batcher);
 
 let partitionTimer: NodeJS.Timeout | undefined;
 let retentionTimer: NodeJS.Timeout | undefined;
@@ -26,6 +28,9 @@ app.addHook("onClose", async () => {
   if (rollupTimer !== undefined) {
     clearInterval(rollupTimer);
   }
+  app.log.warn("Draining pending log batches");
+  await batcher.drain();
+
   app.log.warn("Closing database pool");
   await pool.end();
 });

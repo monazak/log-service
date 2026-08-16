@@ -6,10 +6,15 @@ import Fastify, {
 
 import type pg from "pg";
 import type { Config } from "../config/env.ts";
+import type { LogBatcher } from "../db/batcher.ts";
 import { checkReadiness } from "./readiness.ts";
 import { registerLogRoutes } from "./routes/logs.ts";
 
-export function buildServer(config: Config, pool: pg.Pool): FastifyInstance {
+export function buildServer(
+  config: Config,
+  pool: pg.Pool,
+  batcher: LogBatcher,
+): FastifyInstance {
   const app = Fastify({
     logger: {
       level: config.logLevel,
@@ -45,6 +50,6 @@ export function buildServer(config: Config, pool: pg.Pool): FastifyInstance {
     }
     return reply.code(200).send({ status: "ok" });
   });
-  registerLogRoutes(app, pool);
+  registerLogRoutes(app, pool, batcher);
   return app;
 }
