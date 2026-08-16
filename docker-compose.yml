@@ -30,7 +30,7 @@ services:
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
-      - "statement_timeout=10s"
+      - "statement_timeout=60s"
       - "-c"
       - "effective_io_concurrency=200"
     environment:
