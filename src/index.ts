@@ -18,16 +18,29 @@ let partitionTimer: NodeJS.Timeout | undefined;
 let retentionTimer: NodeJS.Timeout | undefined;
 let rollupTimer: NodeJS.Timeout | undefined;
 
+/**
+ * Teardown, in the order that matters.
+ *
+ * Timers first so no new work starts. Then drain queued batches — entries are
+ * still owned by requests that have not been answered, and closing the pool
+ * first would reject writes those callers were told nothing about. The pool
+ * closes last.
+ *
+ * Registered before listen(): Fastify rejects addHook once the server is
+ * listening, which is also why the background workers return their timer
+ * handles rather than registering their own cleanup.
+ */
 app.addHook("onClose", async () => {
   if (partitionTimer !== undefined) {
     clearInterval(partitionTimer);
   }
   if (retentionTimer !== undefined) {
-    clearInterval(partitionTimer);
+    clearInterval(retentionTimer);
   }
   if (rollupTimer !== undefined) {
     clearInterval(rollupTimer);
   }
+
   app.log.warn("Draining pending log batches");
   await batcher.drain();
 
@@ -37,6 +50,17 @@ app.addHook("onClose", async () => {
 
 registerShutdownHandlers(app);
 
+/**
+ * Startup, in the order that matters.
+ *
+ * listen() comes first so the port is open and /health answers 503 while the
+ * database work happens — the load generator polls it and must see an honest
+ * "not yet" rather than a refused connection.
+ *
+ * Everything up to markReady() is a correctness condition: without migrations
+ * or today's partition, ingestion fails. The schedulers after it are
+ * maintenance — the service is correct without them for a while.
+ */
 try {
   await app.listen({ port: config.port, host: config.host });
 
@@ -49,7 +73,8 @@ try {
   const partitions = await ensurePartitions(pool);
   app.log.info({ created: partitions }, "Partitions ensured");
 
-  partitionTimer = startPartitionScheduler(app, pool);
+  // Runs once at startup so a service that was down for a week does not wait
+  // six hours before cleaning up.
   const expired = await dropExpiredPartitions(pool, config.retentionDays);
   if (expired.length > 0) {
     app.log.warn(
@@ -58,10 +83,12 @@ try {
     );
   }
 
-  retentionTimer = startRetentionScheduler(app, pool, config.retentionDays);
   markReady();
-  rollupTimer = startRollupScheduler(app, pool);
   app.log.info("Service is ready to accept traffic");
+
+  partitionTimer = startPartitionScheduler(app, pool);
+  retentionTimer = startRetentionScheduler(app, pool, config.retentionDays);
+  rollupTimer = startRollupScheduler(app, pool);
 } catch (error) {
   app.log.error(error, "Failed to start service");
   await pool.end().catch(() => {});

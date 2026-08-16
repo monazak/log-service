@@ -22,7 +22,9 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:watch": "vitest",
-    "test:db": "TEST_DATABASE_URL=postgres://logservice:logservice@127.0.0.1:55432/logs vitest run"
+    "test:db": "TEST_DATABASE_URL=postgres://logservice:logservice@127.0.0.1:55432/logs vitest run",
+    "dev:up": "docker compose down && docker compose up -d && sleep 10",
+    "prod:up": "docker compose down && docker compose -f docker-compose.yml up -d --build && sleep 12"
   },
   "repository": {
     "type": "git",
