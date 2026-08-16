@@ -17,6 +17,18 @@ services:
       - "synchronous_commit=off"
       - "-c"
       - "wal_writer_delay=200ms"
+      - "-c"
+      - "autovacuum_vacuum_cost_delay=100ms"
+      - "-c"
+      - "autovacuum_max_workers=1"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "checkpoint_timeout=15min"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
     environment:
       POSTGRES_USER: logservice
       POSTGRES_PASSWORD: logservice
