@@ -42,15 +42,15 @@ export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
     params.groupBy !== undefined ? GROUP_COLUMNS[params.groupBy] : "NULL";
 
   const sql = `
-        SELECT 
-            ${bucketExpr} AS bucket_start,
-            ${groupExpr} AS grp,
-            count(*)::bigint AS cnt
-        FROM logs
-        ${where.sql}
-        GROUP BY bucket_start, grp
-        ORDER BY bucket_start ASC, grp ASC NULLS FIRST
-    `;
+    SELECT
+      ${bucketExpr} AS bucket_start,
+      ${groupExpr} AS grp,
+      count(*)::bigint AS cnt
+    FROM logs
+    ${where.sql}
+    GROUP BY bucket_start, grp
+    ORDER BY bucket_start ASC, grp ASC NULLS FIRST
+  `;
 
   return { sql, values: where.values };
 }
@@ -58,14 +58,25 @@ export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
 /**
  * Builds the rollup-backed aggregation query.
  *
- * Combines two sources: pre-aggregated minute buckets for everything up to the
- * rollup watermark, and raw rows for the minutes after it. The rollup lags by
- * ~2-3 minutes (a bucket is only counted once complete), while the spec requires
- * newly ingested data to be queryable within 20 seconds — so the raw tail is
- * what keeps the endpoint compliant.
+ * Combines two sources: pre-aggregated minute buckets up to the rollup
+ * watermark, and raw rows after it. The rollup lags by a minute or so — a
+ * bucket is only counted once complete — while the spec requires newly
+ * ingested data to be queryable within 20 seconds, so the raw tail is what
+ * keeps the endpoint compliant.
  *
- * The boundary is `log_rollup_state.last_bucket`, the exact point the rollup has
- * been computed to, which guarantees neither double-counting nor gaps.
+ * The boundary is `log_rollup_state.last_bucket`, the exact point the rollup
+ * has been computed to, which guarantees neither double-counting nor gaps.
+ *
+ * The watermark defaults to '-infinity' when the state row is missing. Both
+ * rollup tables are UNLOGGED, so Postgres truncates them after an unclean
+ * shutdown; without the default, the CROSS JOIN against an empty CTE would
+ * produce zero rows and the endpoint would return an empty result set with no
+ * error. With it, the whole range falls to the raw branch: slower, but correct.
+ *
+ * Only `service` and `level` filters are applied here. Attribute and message
+ * filters cannot be served from the rollup at all, and `canUseRollup` is the
+ * guard that keeps them out of this function — if that guard is ever loosened,
+ * this query will silently ignore them.
  */
 export function buildRollupAggregateQuery(params: AggregateParams): AggregateQuery {
   const values: unknown[] = [];
@@ -75,6 +86,8 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
     return `$${values.length}`;
   };
 
+  // The bucket expressions target the `logs` column name; inside the combined
+  // CTE the column is `ts`.
   const bucketExpr = BUCKET_EXPRESSIONS[params.bucket].replace(/"timestamp"/g, "ts");
 
   const groupExpr =
@@ -97,7 +110,10 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
 
   const sql = `
     WITH watermark AS (
-      SELECT last_bucket FROM log_rollup_state WHERE id
+      SELECT COALESCE(
+        (SELECT last_bucket FROM log_rollup_state WHERE id),
+        '-infinity'::timestamptz
+      ) AS last_bucket
     ),
     combined AS (
       SELECT bucket AS ts, service, level, count AS cnt
