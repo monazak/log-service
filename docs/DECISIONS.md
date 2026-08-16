@@ -232,7 +232,7 @@ Dropped in migration `008`.
 **Trade-off accepted:** `attr.<key>` filters are now sequential scans. Partition
 pruning still bounds the scan to the queried time range, so time-filtered
 attribute queries remain usable; unfiltered ones degrade with retention depth.
-All 88 tests still pass, including attribute-filter correctness.
+All 89 tests still pass, including attribute-filter correctness.
 
 This inverts the original reasoning, which optimised one filter at the cost of
 write throughput. The spec weights ingestion far more heavily, and measurement
@@ -332,7 +332,7 @@ Rejected — UUID:
 UUID would be correct with multiple uncoordinated writers, or if IDs had to be
 generated client-side before insert. Neither applies: a single database issues
 all IDs at write time.
-
+All 89 tests still pass, including attribute-filter correctness.
 Note: a partitioned table requires the partition key in the primary key, so the
 PK is `(timestamp, id)` rather than `(id)`. This matches the sort order the spec
 requires, so the constraint costs nothing. The BIGSERIAL sequence is shared across
@@ -695,8 +695,8 @@ were collapsed away when the rollup rows were built. Ranges beginning within the
 last two minutes also fall back — see below.
 
 Result: aggregation p95 under concurrent ingestion fell from 2,715 ms to 611 ms
-with the original 500-entry-batch generator, and measures 474 ms against the
-harness-matched generator at 18,127 logs/sec ingestion. Ingestion throughput
+with the original 500-entry-batch generator, and measures 197 ms against the
+harness-matched generator at 18,950 logs/sec ingestion. Ingestion throughput
 improved as a side effect, because aggregate queries no longer monopolise the
 database for seconds at a time.
 

@@ -3,7 +3,7 @@
 A service that ingests high volumes of structured logs, stores them in
 PostgreSQL, and exposes query and time-bucketed aggregation APIs.
 
-Measured at **18,127 logs/sec** with aggregation at **474 ms p95 under concurrent
+Measured at **18,950 logs/sec** with aggregation at **197 ms p95 under concurrent
 ingestion**, inside the specified container limits (app 0.5 CPU / 256 MB,
 postgres 1 CPU / 1 GB).
 
@@ -316,7 +316,7 @@ cost.
 **Trade-off accepted:** `attr.<key>` filters are now sequential scans. Partition
 pruning still bounds the scan to the queried time range, so time-filtered
 attribute queries remain usable; unfiltered ones degrade with retention depth.
-All 88 tests still pass, including attribute-filter correctness.
+All 89 tests still pass, including attribute-filter correctness.
 
 This inverts the original reasoning, which optimised one filter at the cost of
 write throughput. The spec weights ingestion far more heavily.
@@ -460,10 +460,10 @@ Full methodology, measurements, and the mistakes made along the way are in
 
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | **18,127 logs/sec** | ✅ |
+| Sustain ≥ 15,000 logs/sec | **18,950 logs/sec** | ✅ |
 | No dropped requests or crashes | 0 timeouts, 0 errors | ✅ |
-| Aggregation p95 < 1s | **474 ms** under concurrent ingestion | ✅ |
-| Query performance during ingestion | 39 of 40 aggregates completed | ✅ |
+| Aggregation p95 < 1s | **197 ms** under concurrent ingestion | ✅ |
+| Query performance during ingestion | 40 of 40 aggregates completed | ✅ |
 | ~1,000,000 stored records | 1M seeded, 2M+ during the run | ✅ |
 | Data queryable within 20s | Raw-tail merge past the rollup watermark | ✅ |
 | 1 aggregation/sec during ingestion | Sustained | ✅ |
@@ -478,10 +478,10 @@ saturation point.
 | Test environment | Docker Compose on macOS (Apple Silicon); app 0.5 CPU / 256 MB, postgres 1 CPU / 1 GB. Docker Desktop runs containers in a Linux VM, so native Linux should perform better. |
 | Dataset size | 1,000,000 seeded rows spanning 30 days; 2M+ during the run |
 | Batch size | 27 entries, matching the graded harness. Earlier local runs used 500 — see below. |
-| Ingestion rate | **18,127 logs/sec** sustained over 60s against a fixed 15,000/sec arrival rate |
+| Ingestion rate | **18,950 logs/sec** sustained over 60s against a fixed 15,000/sec arrival rate |
 | Query rate | 1 aggregation/sec, concurrent with ingestion |
-| Query latency | p50 220 ms · **p95 474 ms** · p99 2,282 ms |
-| Resource usage | app 42.7% of 0.5 CPU, 49 MiB of 256 MB · postgres 49.8% of 1 CPU, 334 MiB of 1 GB |
+| Query latency | p50 148 ms · **p95 197 ms** · p99 247 ms |
+| Resource usage | app 41.5% of 0.5 CPU, 48 MiB of 256 MB · postgres 40.9% of 1 CPU, 340 MiB of 1 GB |
 | Bottlenecks discovered | Harness batch size, GIN index maintenance, per-request round trips, DELETE bloat, disk-spilling sorts |
 | Optimizations applied | COPY ingestion, micro-batching, GIN index removal, unlogged rollups, WAL/checkpoint tuning, pool sizing, `synchronous_commit=off`, `fillfactor=100` |
 
@@ -516,18 +516,22 @@ generator.
 6. **Unlogged rollup tables.** Derived data needs no WAL.
 7. **Pool size 8→20.** ~40 concurrent requests against 8 connections queued.
 
-### Latency tails
+#### Latency tails
 
-p99 is heavier than p95 — 1,035 ms for ingestion and 2,282 ms for aggregation —
-attributable to checkpoint flushes (586 MB of block I/O during the run). The spec
-measures p95, which stays well inside target, but the tail is real and would need
-more aggressive background writing to flatten.
+p99 is heavier than p95 for ingestion — 953 ms against 145 ms — attributable to
+checkpoint flushes; the run wrote 1.8 GB of block I/O in sixty seconds.
 
----
+Aggregation shows no such gap (247 ms p99 against 197 ms p95), because
+rollup-backed queries touch a bounded number of rows regardless of how much data
+arrived while they ran.
+
+The spec measures p95, which stays well inside target on both. Flattening the
+ingestion tail would need more aggressive background writing, trading average
+throughput for tail consistency.
 
 ## Testing
 
-88 tests: unit tests for validation, query building, and cursors; integration
+89 tests: unit tests for validation, query building, and cursors; integration
 tests against a real PostgreSQL instance for all four endpoints.
 
 ```bash

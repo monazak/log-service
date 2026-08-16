@@ -15,27 +15,28 @@ concurrently in a second process.
 
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | **18,127 logs/sec** | ✅ |
+| Sustain ≥ 15,000 logs/sec | **18,950 logs/sec** | ✅ |
 | No dropped requests or crashes | 0 timeouts, 0 errors | ✅ |
-| Aggregation p95 < 1s | **474 ms** under concurrent ingestion | ✅ |
-| Query performance during ingestion | 39 of 40 aggregates completed | ✅ |
-| ~1,000,000 stored records | 1M seeded, 2M+ during the run | ✅ |
+| Aggregation p95 < 1s | **197 ms** under concurrent ingestion | ✅ |
+| Query performance during ingestion | 40 of 40 aggregates completed | ✅ |
+| ~1,000,000 stored records | 1M seeded + 1.1M ingested during the run | ✅ |
 | Data queryable within 20s | Raw-tail merge past the rollup watermark | ✅ |
 | 1 aggregation/sec during ingestion | Sustained | ✅ |
 
 | Resource | Peak | Limit |
 |---|---|---|
-| App CPU | 42.7% | 50% (0.5 CPU) |
-| App memory | 49 MiB | 256 MB |
-| Postgres CPU | 49.8% | 100% (1 CPU) |
-| Postgres memory | 334 MiB | 1 GB |
+| App CPU | 41.5% | 50% (0.5 CPU) |
+| App memory | 48 MiB | 256 MB |
+| Postgres CPU | 40.9% | 100% (1 CPU) |
+| Postgres memory | 340 MiB | 1 GB |
 
-Both containers retain headroom, so this is a sustained rate rather than a
-saturation point.
+Both containers sit below half their limits, so this is a sustained rate rather
+than a saturation point.
 
 ### Reproducing
 
 ```bash
+docker compose down -v
 docker compose -f docker-compose.yml up -d --build
 docker compose exec -T postgres psql -U logservice -d logs < scripts/seed.sql
 docker compose exec postgres psql -U logservice -d logs \
@@ -45,6 +46,11 @@ node scripts/loadgen-v2.mjs 15000 60 27    # window A: ingestion
 node scripts/querygen.mjs 40               # window B: concurrent aggregation
 docker stats --no-stream                   # window C: resource usage
 ```
+
+`down -v` matters. Earlier figures in this document were taken on a database that
+had accumulated data across successive runs, which is why aggregation p95 varied
+between 197 ms and 1,695 ms on nominally identical workloads. Reset the state, or
+the number measures your history rather than your service.
 
 The rollup rebuild is needed because seeded data predates the service, and the
 refresh only recomputes a trailing window. See Known limitations.
@@ -102,13 +108,19 @@ optimisation after that point was measured rather than guessed.
 Container limits verified as applied, not merely declared:
 
 ```
-docker inspect log-service-app-1 --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'
-→ 500000000 268435456    (0.5 CPU, 256 MB)
+$ docker inspect log-service-app-1 \
+    --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'
+500000000 268435456        # 0.5 CPU, 256 MB
 ```
+
+`deploy.resources.limits` originates in Docker Swarm and older Compose versions
+ignore it silently outside a swarm — a measurement taken that way would report
+throughput on the full host. Compose v2 does apply it, confirmed above.
 
 ### Measurement protocol
 
-Every run is preceded by a reset:
+Every run starts from a clean database (`docker compose down -v`, rebuild, seed).
+Where a full reset was impractical during iteration, runs were preceded by:
 
 ```
 DELETE FROM logs WHERE "timestamp" >= CURRENT_DATE - 1;
@@ -134,7 +146,7 @@ several comparisons were invalidated — see "Measurement discipline" below.
 
 | Metric | Value |
 |---|---|
-| Rows | 1,000,000 seeded (2M+ during a run) |
+| Rows | 1,000,000 seeded; 2.1M after a 60-second run |
 | Time span | 30 days |
 | Partitions | 36 (32 daily + 3 future + default) |
 | Heap size | 173 MB |
@@ -176,7 +188,9 @@ acquisition, and commit cost more than the write. Postgres saturated at 101% CPU
 while the application sat at 21% of its 0.5 CPU allowance — the wrong side was
 busy.
 
-Addressed by micro-batching and COPY (Optimizations 1 and 2).
+Addressed by micro-batching and COPY (Optimizations 1 and 2). After both, the two
+containers sit at 41.5% and 40.9% of their respective limits: the work is
+balanced rather than pinned on one side.
 
 ### 2. GIN index maintenance
 
@@ -204,14 +218,22 @@ against a 1,000 ms target.
 
 Addressed by pre-aggregated rollups (Optimization 5).
 
-### 5. DELETE bloat
+### 5. Serialised writes
+
+Micro-batching originally allowed one flush at a time, capping throughput at
+(rows per batch ÷ flush duration) regardless of free database capacity. The
+signature was Postgres sitting at 20–49% CPU while throughput refused to move.
+
+Addressed by allowing four concurrent flushes (Optimization 7).
+
+### 6. DELETE bloat
 
 Quantified below under "Measurement discipline". 380 MB of dead space on a
 966,812-row table, and a 15x aggregation slowdown.
 
 Addressed at design time by partition-based retention.
 
-### 6. Planning time scaling with partition count
+### 7. Planning time scaling with partition count
 
 2.6 ms at 9 partitions, 14.5 ms at 36, paid per request with no caching.
 
@@ -224,8 +246,8 @@ Addressed at design time by partition-based retention.
 Entries from concurrent requests accumulate for up to 10 ms and are written
 together.
 
-A trigger-style per-request write pays connection acquisition, round trip, and
-commit for 27 rows. Combining requests amortises that across several hundred.
+A per-request write pays connection acquisition, round trip, and commit for 27
+rows. Combining requests amortises that across several hundred.
 
 **Durability is preserved:** each request's promise resolves only after the
 combined write commits. No batch is acknowledged before Postgres has accepted it,
@@ -269,7 +291,7 @@ harness, index maintenance was the dominant write cost.
 pruning still bounds the scan to the queried time range, so time-filtered
 attribute queries remain usable; unfiltered ones degrade with retention depth.
 
-All 88 tests still pass, including attribute-filter correctness.
+All 89 tests still pass, including attribute-filter correctness.
 
 This inverts the original design, which optimised one filter at the cost of write
 throughput. The spec weights ingestion far more heavily, and measurement showed
@@ -323,9 +345,11 @@ loss, not a normal restart — could lose the last fraction of a second. The
 recorded rather than hidden.
 
 **On `statement_timeout`:** initially set to 10s, which cancelled the 1M-row seed
-insert mid-run. Raised to 60s. The graded harness times out at 5s anyway, so the
-protective value was already provided client-side; the server-side limit exists
-to bound a pathological query, not to enforce the client's SLA.
+insert mid-run and would equally have cancelled a long migration at startup,
+turning a slow operation into a failed boot. Raised to 60s. The graded harness
+times out at 5s anyway, so client-side protection already exists; the server-side
+limit bounds a pathological query, not the client's SLA. Migrations additionally
+run with `SET LOCAL statement_timeout = 0`.
 
 ---
 
@@ -426,6 +450,35 @@ queries are very short, so a larger pool costs little and removes the queue.
 
 ---
 
+## Optimization 7: Concurrent flushes and a bounded queue
+
+The batcher originally allowed one flush at a time. That caps throughput at
+(rows per batch ÷ flush duration) no matter how much database capacity is free,
+and the symptom was unmistakable: throughput flat at ~19,000/sec while Postgres
+sat at 20–49% CPU. A saturated database looks different.
+
+Four concurrent flushes, bounded above by the connection pool (20, leaving room
+for reads) and by contention between concurrent COPYs on the same daily
+partition's index pages.
+
+### Bounded queue
+
+Measured at 500-entry batches past the sustainable rate: 1,827 of 5,244 requests
+timed out client-side while their promises stayed pending in the queue, and
+application memory doubled from 47 to 115 MiB in sixty seconds. Left unbounded,
+that path ends at the heap ceiling and an OOM kill.
+
+The queue now rejects with 503 and `Retry-After` beyond 50,000 pending entries.
+With the bound, the same run held memory at 45–47 MiB and improved p99 from
+1,969 ms to 1,313 ms — a shorter queue is a shorter wait.
+
+503 rather than 500: the spec states that shedding load beats crashing, and that
+a batch must never be acknowledged unless written. A 503 says "transient, retry"
+where a 500 would suggest a defect. The bound was never reached at the graded
+batch size; it exists as a ceiling, not a working mechanism.
+
+---
+
 ## Measurement history
 
 ### Local generator (fixed concurrency, 500-entry batches)
@@ -460,37 +513,53 @@ mattered.
 
 ### Matched local generator, after all optimizations
 
+Clean database, 1M rows seeded, rollup rebuilt, aggregation running concurrently.
+
 | Metric | Value |
 |---|---|
 | Duration | 60 s |
 | Batch size | 27 |
 | Target arrival rate | 15,000 logs/sec |
-| Requests sent | 40,288 |
+| Requests sent | 42,117 |
 | Timeouts | 0 |
 | Errors | 0 |
-| Logs accepted | 1,087,776 |
-| **Throughput** | **18,127 logs/sec** |
-| Latency p50 / p95 / p99 | 17 ms / 187 ms / 1,035 ms |
+| Logs accepted | 1,137,159 |
+| **Throughput** | **18,950 logs/sec** |
+| Latency p50 / p95 / p99 | 14 ms / 145 ms / 953 ms |
 
 Concurrent aggregation during the same run:
 
 | Metric | Value |
 |---|---|
-| Requests | 39 of 40 |
+| Requests | 40 of 40 |
 | Errors | 0 |
-| Buckets per request | 155 |
-| Latency p50 / p95 / p99 | 220 ms / **474 ms** / 2,282 ms |
+| Buckets per request | 149 |
+| Latency p50 / p95 / p99 | 148 ms / **197 ms** / 247 ms |
+
+### Capacity ceiling
+
+Throughput is flat at ~19,000 logs/sec across batch sizes of 27 and 100 — four
+times fewer requests carrying the same rows produced the same figure, so neither
+per-request nor per-row cost was binding at that rate.
+
+Pushing to 500-entry batches reached 26,322 logs/sec, but with 1,903 client
+timeouts out of 5,311 requests: past the sustainable point, not a usable rate.
+The reported figure is the 27-entry measurement, which is also the graded batch
+size.
 
 ---
 
 ## Latency tails
 
-p99 is heavier than p95 — 1,035 ms for ingestion and 2,282 ms for aggregation —
-attributable to checkpoint flushes; 586 MB of block I/O was written during the
-60-second run.
+p99 is heavier than p95 for ingestion — 953 ms against 145 ms — attributable to
+checkpoint flushes; the run wrote 1.8 GB of block I/O in sixty seconds.
 
-The spec measures p95, which stays well inside target, but the tail is real.
-Flattening it would need more aggressive background writing, which trades average
+Aggregation shows no such gap: 247 ms p99 against 197 ms p95. Rollup-backed
+queries touch a bounded number of rows regardless of how much data arrived while
+they ran, so their cost does not grow with the ingestion rate.
+
+The spec measures p95, which stays well inside target on both. Flattening the
+ingestion tail would need more aggressive background writing, trading average
 throughput for tail consistency. Not pursued, since the measured target is p95.
 
 ---
@@ -513,6 +582,11 @@ An early comparison suggested that *lowering* ingestion concurrency from 8 to 4
 made aggregation four times worse (1,703 ms → 6,577 ms p95) — which contradicts
 any contention explanation. The cause: each run appends millions of rows, so each
 successive test queried a larger dataset than the one before.
+
+The same effect reappeared late in the project: aggregation p95 measured 1,695 ms
+on a database that had accumulated six runs of data, and 197 ms on a clean one
+with the same nominal workload. The final protocol starts every measurement from
+`docker compose down -v`.
 
 ### DELETE bloat, quantified
 
@@ -553,10 +627,12 @@ Recorded so the gaps are explicit rather than implied.
 - **Trigram index cost for `q`.** `pg_trgm` is enabled but no index was created.
   Load testing did not exercise `q` heavily enough to justify measuring the
   write-side cost, so no before/after comparison exists.
-- **Batch size sensitivity beyond 27 and 500.** The two points measured differ by
-  40x in outcome; the curve between them was not mapped.
+- **Batch size sensitivity between 100 and 500.** Three points were measured (27,
+  100, 500); the curve between the last two, where the sustainable ceiling lies,
+  was not mapped.
 - **Flush interval sensitivity.** Fixed at 10 ms. Wider intervals would batch
   more aggressively at the cost of per-request latency.
+- **Concurrent flush count.** Fixed at 4. Two and eight were not compared.
 
 ---
 
