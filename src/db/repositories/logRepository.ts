@@ -24,6 +24,20 @@ import { buildWhereClause } from "../queries/whereClause.ts";
 /** Postgres caps a statement at 65535 parameters; 5 columns means 13107 rows. */
 const MAX_ROWS_PER_STATEMENT = 5000;
 
+/**
+ * Bytes of COPY payload accumulated before handing a chunk to the stream.
+ *
+ * CPU profiling under load put `writeBuffer` at 51% of application time: a
+ * generator yielding one row at a time produces one socket write per row, and
+ * the syscall costs far more than formatting the row did. Batching amortises it
+ * across hundreds of rows.
+ *
+ * 64 KB sits near a typical socket buffer, so a chunk usually leaves in one
+ * write without the stream fragmenting it again — and a single chunk is a
+ * trivial allocation against a 256 MB budget.
+ */
+const COPY_CHUNK_BYTES = 64 * 1024;
+
 export interface LogRow {
   readonly id: string;
   readonly timestamp: Date;
@@ -57,8 +71,20 @@ const COPY_ESCAPES: Record<string, string> = {
   "\t": "\\t",
 };
 
+const NEEDS_ESCAPE = /[\\\n\r\t]/;
+
 function escapeCopyField(value: string): string {
-  return value.replace(/[\\\n\r\t]/g, (char) => COPY_ESCAPES[char] ?? char);
+  // Most fields contain none of these. Testing first is markedly cheaper than
+  // running the replace machinery on every field of every entry, and this runs
+  // four times per row on the hot path.
+  return NEEDS_ESCAPE.test(value)
+    ? value.replace(/[\\\n\r\t]/g, (char) => COPY_ESCAPES[char] ?? char)
+    : value;
+}
+
+/** Formats one entry as a text-format COPY row, including its terminator. */
+function copyRow(entry: ValidLogEntry): string {
+  return `${entry.timestamp.toISOString()}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(JSON.stringify(entry.attributes))}\n`;
 }
 
 /** Floors a timestamp to its minute, matching the rollup's bucket granularity. */
@@ -160,8 +186,7 @@ async function applyRollupDeltas(
  *
  * COPY bypasses the query parser and planner entirely: no SQL text to parse, no
  * plan to build, no bind parameters. The formatting work moves to the
- * application, which measured at 6.6% of its 0.5 CPU while Postgres sat at 76%
- * — spare capacity on exactly the side that had none.
+ * application, which had spare capacity on exactly the side that had none.
  *
  * Text format rather than binary: binary is marginally faster but requires
  * encoding every type by hand, and a single encoding bug corrupts data
@@ -173,8 +198,10 @@ async function applyRollupDeltas(
  * removes the watermark, the raw-tail merge, and the recent-range fallback the
  * previous design needed to paper over a lagging rollup.
  *
- * Rows stream from a generator rather than a concatenated string, so a
- * 5000-row batch never materialises whole in a 256 MB process.
+ * Rows stream in 64 KB chunks rather than as one concatenated string, so a
+ * 5000-row batch never materialises whole in a 256 MB process — and rather than
+ * one row at a time, which profiling showed spends most of its time in socket
+ * writes.
  */
 export async function copyLogs(
   pool: pg.Pool,
@@ -197,8 +224,19 @@ export async function copyLogs(
 
     const source = Readable.from(
       (function* () {
+        let chunk = "";
+
         for (const entry of entries) {
-          yield `${entry.timestamp.toISOString()}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(JSON.stringify(entry.attributes))}\n`;
+          chunk += copyRow(entry);
+
+          if (chunk.length >= COPY_CHUNK_BYTES) {
+            yield chunk;
+            chunk = "";
+          }
+        }
+
+        if (chunk.length > 0) {
+          yield chunk;
         }
       })(),
     );
