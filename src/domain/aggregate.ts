@@ -19,7 +19,7 @@ export type BucketSize = (typeof BUCKET_SIZES)[number];
 export const GROUP_BY_FIELDS = ["service", "level"] as const;
 export type GroupByField = (typeof GROUP_BY_FIELDS)[number];
 
-const RECENT_WINDOW_MS = 2 * 60 * 1000;
+const MINUTE_MS = 60_000;
 
 export interface AggregateParams {
   readonly filters: LogFilters;
@@ -94,21 +94,35 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
 }
 
 /**
- * The rollup stores (bucket, service, level, count). A query is servable from
- * it only when every column it needs exists there.
+ * Whether a query can be answered from the rollup.
  *
- * Attribute filters and message search are not: both dimensions were collapsed
- * away when the rollup rows were built, and messages are not stored at all.
+ * The rollup stores (bucket, service, level, count) and is maintained in the
+ * same transaction as the writes it summarises, so it is exactly consistent
+ * with `logs` at every commit. There is no lag to compensate for and therefore
+ * no time-based fallback: the only question is whether the query needs a column
+ * the rollup does not have.
+ *
+ * Two cases it cannot serve:
+ *
+ * Attribute filters and message search. Both dimensions were collapsed away
+ * when the rows were built, and messages are not stored at all.
+ *
+ * Range bounds that fall inside a minute. Rollup rows are whole minutes, so a
+ * range starting at 10:00:30 would either drop the 10:00 bucket entirely or
+ * include the thirty seconds before the requested start. Neither is correct, so
+ * unaligned ranges read the raw table. This costs little in practice: the load
+ * generator and dashboard-style clients use aligned boundaries, and a
+ * mid-minute range is by nature a narrow one.
  */
-export function canUseRollup(
-  params: AggregateParams,
-  now: number = Date.now(),
-): boolean {
+export function canUseRollup(params: AggregateParams): boolean {
   const hasAttributeFilter = Object.keys(params.filters.attributes).length > 0;
 
   if (hasAttributeFilter || params.filters.q !== undefined) {
     return false;
   }
 
-  return now - params.since.getTime() >= RECENT_WINDOW_MS;
+  const sinceAligned = params.since.getTime() % MINUTE_MS === 0;
+  const untilAligned = params.until.getTime() % MINUTE_MS === 0;
+
+  return sinceAligned && untilAligned;
 }

@@ -4,15 +4,25 @@ import Fastify, {
   LogController,
 } from "fastify";
 
-import type pg from "pg";
 import type { Config } from "../config/env.ts";
 import type { LogBatcher } from "../db/batcher.ts";
+import type { Pools } from "../db/pool.ts";
 import { checkReadiness } from "./readiness.ts";
 import { registerLogRoutes } from "./routes/logs.ts";
 
+/**
+ * Builds the server without starting it.
+ *
+ * Separate from listen() so integration tests can use Fastify's inject() — the
+ * same routing, parsing, and error handling without binding a port.
+ *
+ * Takes both pools. Reads go through `pools.read` and writes through the
+ * batcher, which holds `pools.write`. A slow aggregation can therefore only
+ * exhaust read connections; ingestion keeps its own.
+ */
 export function buildServer(
   config: Config,
-  pool: pg.Pool,
+  pools: Pools,
   batcher: LogBatcher,
 ): FastifyInstance {
   const app = Fastify({
@@ -42,14 +52,18 @@ export function buildServer(
       .send({ error: `route ${request.method} ${request.url} not found` });
   });
 
+  // Health checks the write pool: that is the one ingestion depends on, and a
+  // service that cannot write is not ready regardless of whether it can read.
   app.get("/health", async (_request, reply) => {
-    const state = await checkReadiness(pool);
+    const state = await checkReadiness(pools.write);
 
     if (!state.ready) {
       return reply.code(503).send({ status: state.reason ?? "unavailable" });
     }
     return reply.code(200).send({ status: "ok" });
   });
-  registerLogRoutes(app, pool, batcher);
+
+  registerLogRoutes(app, pools.read, batcher);
+
   return app;
 }

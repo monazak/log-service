@@ -16,17 +16,12 @@ import { buildWhereClause } from "../queries/whereClause.ts";
 /**
  * Persistence for log entries.
  *
- * Writes go through `copyLogs`. `insertLogs` is the earlier multi-row INSERT
- * implementation, retained because it is the fallback if COPY ever proves
- * problematic and because the comparison between them is part of the
- * performance story. It is not on the hot path.
- *
- * Reads are unbatched: `queryLogs` and `aggregateLogs` each issue one
- * statement. Only writes benefit from amortising the round trip.
+ * Writes go through `copyLogs`, which also maintains the 1-minute rollup in the
+ * same transaction. `insertLogs` is the earlier multi-row INSERT, retained as a
+ * reference implementation and fallback; it is not on the hot path.
  */
 
 /** Postgres caps a statement at 65535 parameters; 5 columns means 13107 rows. */
-
 const MAX_ROWS_PER_STATEMENT = 5000;
 
 export interface LogRow {
@@ -52,8 +47,8 @@ export interface AggregateRow {
  * split one row into several — with no error raised. Backslash is escaped
  * first, or the escapes introduced below would themselves be escaped.
  *
- * Null bytes need no handling here: validation rejects them, because Postgres
- * cannot store them in a TEXT column at all.
+ * Null bytes need no handling: validation rejects them, because Postgres cannot
+ * store them in a TEXT column at all.
  */
 const COPY_ESCAPES: Record<string, string> = {
   "\\": "\\\\",
@@ -66,12 +61,106 @@ function escapeCopyField(value: string): string {
   return value.replace(/[\\\n\r\t]/g, (char) => COPY_ESCAPES[char] ?? char);
 }
 
+/** Floors a timestamp to its minute, matching the rollup's bucket granularity. */
+function minuteBucket(timestamp: Date): number {
+  return Math.floor(timestamp.getTime() / 60_000) * 60_000;
+}
+
+interface RollupDelta {
+  readonly bucket: Date;
+  readonly service: string;
+  readonly level: string;
+  readonly count: number;
+}
+
 /**
- * Bulk-inserts entries using COPY.
+ * Counts a batch by (minute, service, level).
+ *
+ * A batch of several thousand entries collapses to at most
+ * (minutes x services x levels) rows — typically around twenty. That is the
+ * whole point: the rollup update becomes proportional to the batch's
+ * *cardinality* rather than its size, and independent of how much data is
+ * already stored.
+ */
+function computeRollupDeltas(entries: readonly ValidLogEntry[]): RollupDelta[] {
+  const counts = new Map<string, RollupDelta & { count: number }>();
+
+  for (const entry of entries) {
+    const bucketMs = minuteBucket(entry.timestamp);
+    const key = `${bucketMs}\u0000${entry.service}\u0000${entry.level}`;
+
+    const existing = counts.get(key);
+
+    if (existing === undefined) {
+      counts.set(key, {
+        bucket: new Date(bucketMs),
+        service: entry.service,
+        level: entry.level,
+        count: 1,
+      });
+    } else {
+      existing.count += 1;
+    }
+  }
+
+  return [...counts.values()];
+}
+
+/**
+ * Applies a batch's counters to the rollup.
+ *
+ * `ON CONFLICT ... DO UPDATE SET count = count + EXCLUDED.count` is what makes
+ * this incremental: concurrent batches touching the same minute serialise on
+ * the row and add rather than overwrite.
+ *
+ * Ordered by the primary key before insertion. Two concurrent batches updating
+ * the same rows in different orders would deadlock; a consistent order makes
+ * one wait instead.
+ */
+async function applyRollupDeltas(
+  client: pg.PoolClient,
+  deltas: readonly RollupDelta[],
+): Promise<void> {
+  if (deltas.length === 0) {
+    return;
+  }
+
+  const ordered = [...deltas].sort((a, b) => {
+    const byBucket = a.bucket.getTime() - b.bucket.getTime();
+    if (byBucket !== 0) {
+      return byBucket;
+    }
+    const byService = a.service.localeCompare(b.service);
+    return byService !== 0 ? byService : a.level.localeCompare(b.level);
+  });
+
+  const values: unknown[] = [];
+  const rows: string[] = [];
+
+  for (const delta of ordered) {
+    const base = values.length;
+    rows.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
+    values.push(delta.bucket, delta.service, delta.level, delta.count);
+  }
+
+  await client.query(
+    `
+      INSERT INTO log_rollup_1m (bucket, service, level, count)
+      VALUES ${rows.join(", ")}
+      ON CONFLICT (bucket, service, level)
+      DO UPDATE SET count = log_rollup_1m.count + EXCLUDED.count
+    `,
+    values,
+  );
+}
+
+/**
+ * Bulk-inserts entries using COPY, and updates the rollup in the same
+ * transaction.
  *
  * COPY bypasses the query parser and planner entirely: no SQL text to parse, no
  * plan to build, no bind parameters. The formatting work moves to the
- * application, which measured at 21% of its 0.5 CPU while Postgres sat at 101%
+ * application, which measured at 6.6% of its 0.5 CPU while Postgres sat at 76%
  * — spare capacity on exactly the side that had none.
  *
  * Text format rather than binary: binary is marginally faster but requires
@@ -79,8 +168,13 @@ function escapeCopyField(value: string): string {
  * silently. Text format's escaping rules are small enough to implement
  * correctly and verify by test.
  *
- * Rows stream from a generator rather than a concatenated string so a 5000-row
- * batch never materialises whole in a 256 MB process.
+ * The rollup upsert shares the transaction, so `logs` and `log_rollup_1m` can
+ * never disagree: either both changes commit or neither does. That is what
+ * removes the watermark, the raw-tail merge, and the recent-range fallback the
+ * previous design needed to paper over a lagging rollup.
+ *
+ * Rows stream from a generator rather than a concatenated string, so a
+ * 5000-row batch never materialises whole in a 256 MB process.
  */
 export async function copyLogs(
   pool: pg.Pool,
@@ -93,6 +187,8 @@ export async function copyLogs(
   const client = await pool.connect();
 
   try {
+    await client.query("BEGIN");
+
     const stream = client.query(
       copyFrom(
         `COPY logs ("timestamp", level, service, message, attributes) FROM STDIN`,
@@ -108,12 +204,17 @@ export async function copyLogs(
     );
 
     await pipeline(source, stream);
+
+    await applyRollupDeltas(client, computeRollupDeltas(entries));
+
+    await client.query("COMMIT");
     client.release();
 
     return entries.length;
   } catch (error) {
     // Destroy rather than return: a connection abandoned mid-COPY is left in a
-    // protocol state the next borrower cannot recover from.
+    // protocol state the next borrower cannot recover from. ROLLBACK is
+    // implicit in destroying the connection.
     client.release(error as Error);
     throw error;
   }
@@ -122,9 +223,8 @@ export async function copyLogs(
 /**
  * Multi-row INSERT. Superseded by copyLogs on the ingestion path.
  *
- * Kept as a reference implementation and fallback. Chunking exists because a
- * single statement is capped at 65535 bind parameters, and because an oversized
- * statement holds a large parameter array and query string in memory.
+ * Kept as a reference implementation. Note that it does not maintain the
+ * rollup — `reconcile_log_rollup` would be needed after using it.
  */
 export async function insertLogs(
   pool: pg.Pool,
