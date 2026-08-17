@@ -3,8 +3,8 @@ import type {
   BucketSize,
   GroupByField,
 } from "../../domain/aggregate.ts";
+import { rollupRange } from "../../domain/aggregate.ts";
 import { buildWhereClause } from "./whereClause.ts";
-
 /**
  * Builds the time-bucketed aggregation query.
  *
@@ -77,21 +77,28 @@ export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
  * Builds the rollup-backed aggregation query.
  *
  * The rollup is maintained inside the same transaction as the COPY that writes
- * the raw rows, so it is exactly consistent with `logs` at every commit. That
- * removes everything the previous design needed to compensate for a lagging
- * rollup: no watermark, no UNION ALL against a raw tail, no recent-range
- * fallback. A single scan of one small table answers the query.
+ * the raw rows, so it is exactly consistent with `logs` at every commit. What
+ * remains is a granularity mismatch, not a freshness one: rollup rows are whole
+ * minutes, and a caller may ask for a range that starts or ends mid-minute.
  *
- * Scale is the point. The rollup holds one row per (minute, service, level) —
- * about twenty rows per minute regardless of ingest rate — where the raw table
- * holds one row per log entry. Aggregating a day is thousands of rows instead
- * of millions, and that cost does not grow as ingestion continues.
+ * The query therefore unions three sources:
  *
- * Only `service` and `level` filters are applied here. Attribute and message
- * filters cannot be served from the rollup at all — those dimensions were
- * collapsed away when the rows were built — and `canUseRollup` is the guard
- * that keeps them out of this function. If that guard is ever loosened, this
- * query will silently ignore them.
+ *   - raw rows from `since` up to the first whole minute
+ *   - rollup rows for every whole minute inside the range
+ *   - raw rows from the last whole minute up to `until`
+ *
+ * Each raw edge spans under a minute, so its cost is bounded by the ingest rate
+ * rather than by how much data is stored — while the rollup span, which is
+ * almost the entire range, costs about twenty rows per minute regardless.
+ *
+ * This matters because a client computing `since` as `Date.now() - N` never
+ * produces an aligned boundary. Requiring alignment would have sent every such
+ * query to the raw table and wasted the rollup entirely.
+ *
+ * Only `service` and `level` filters are applied. Attribute and message filters
+ * cannot be served from the rollup, and `canUseRollup` is the guard that keeps
+ * them out of this function — if that guard is ever loosened, this query will
+ * silently ignore them.
  */
 export function buildRollupAggregateQuery(params: AggregateParams): AggregateQuery {
   const values: unknown[] = [];
@@ -102,30 +109,84 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
   };
 
   const bucketExpr = ROLLUP_BUCKET_EXPRESSIONS[params.bucket];
-
   const groupExpr =
     params.groupBy !== undefined ? GROUP_COLUMNS[params.groupBy] : "NULL";
 
-  const conditions: string[] = [
-    `bucket >= ${param(params.since)}`,
-    `bucket < ${param(params.until)}`,
-  ];
+  const { rollupSince, rollupUntil, hasRollupSpan } = rollupRange(params);
 
-  if (params.filters.service !== undefined) {
-    conditions.push(`service = ${param(params.filters.service)}`);
+  const filterOn = (column: string): string[] => {
+    const conditions: string[] = [];
+
+    if (params.filters.service !== undefined) {
+      conditions.push(
+        `${column === "bucket" ? "" : ""}service = ${param(params.filters.service)}`,
+      );
+    }
+    if (params.filters.level !== undefined) {
+      conditions.push(`level = ${param(params.filters.level)}`);
+    }
+
+    return conditions;
+  };
+
+  const sources: string[] = [];
+
+  // Leading partial minute, when `since` is not on a minute boundary.
+  if (!hasRollupSpan || rollupSince.getTime() > params.since.getTime()) {
+    const upper = hasRollupSpan ? rollupSince : params.until;
+    const conditions = [
+      `"timestamp" >= ${param(params.since)}`,
+      `"timestamp" < ${param(upper)}`,
+      ...filterOn("timestamp"),
+    ];
+
+    sources.push(`
+      SELECT date_trunc('minute', "timestamp") AS bucket,
+             service, level, 1::bigint AS count
+      FROM logs
+      WHERE ${conditions.join(" AND ")}
+    `);
   }
 
-  if (params.filters.level !== undefined) {
-    conditions.push(`level = ${param(params.filters.level)}`);
+  if (hasRollupSpan) {
+    const conditions = [
+      `bucket >= ${param(rollupSince)}`,
+      `bucket < ${param(rollupUntil)}`,
+      ...filterOn("bucket"),
+    ];
+
+    sources.push(`
+      SELECT bucket, service, level, count
+      FROM log_rollup_1m
+      WHERE ${conditions.join(" AND ")}
+    `);
+
+    // Trailing partial minute.
+    if (rollupUntil.getTime() < params.until.getTime()) {
+      const conditions = [
+        `"timestamp" >= ${param(rollupUntil)}`,
+        `"timestamp" < ${param(params.until)}`,
+        ...filterOn("timestamp"),
+      ];
+
+      sources.push(`
+        SELECT date_trunc('minute', "timestamp") AS bucket,
+               service, level, 1::bigint AS count
+        FROM logs
+        WHERE ${conditions.join(" AND ")}
+      `);
+    }
   }
 
   const sql = `
+    WITH combined AS (
+      ${sources.join("\n      UNION ALL\n")}
+    )
     SELECT
       ${bucketExpr} AS bucket_start,
       ${groupExpr} AS grp,
       sum(count)::bigint AS cnt
-    FROM log_rollup_1m
-    WHERE ${conditions.join(" AND ")}
+    FROM combined
     GROUP BY bucket_start, grp
     ORDER BY bucket_start ASC, grp ASC NULLS FIRST
   `;

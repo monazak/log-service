@@ -94,35 +94,58 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
 }
 
 /**
- * Whether a query can be answered from the rollup.
+ * Whether a query can be answered using the rollup at all.
  *
  * The rollup stores (bucket, service, level, count) and is maintained in the
  * same transaction as the writes it summarises, so it is exactly consistent
- * with `logs` at every commit. There is no lag to compensate for and therefore
- * no time-based fallback: the only question is whether the query needs a column
- * the rollup does not have.
+ * with `logs` at every commit. There is no lag to compensate for — the only
+ * question is whether the query needs a column the rollup does not have.
  *
- * Two cases it cannot serve:
+ * Attribute filters and message search are the two it cannot serve: both
+ * dimensions were collapsed away when the rows were built, and messages are not
+ * stored at all.
  *
- * Attribute filters and message search. Both dimensions were collapsed away
- * when the rows were built, and messages are not stored at all.
- *
- * Range bounds that fall inside a minute. Rollup rows are whole minutes, so a
- * range starting at 10:00:30 would either drop the 10:00 bucket entirely or
- * include the thirty seconds before the requested start. Neither is correct, so
- * unaligned ranges read the raw table. This costs little in practice: the load
- * generator and dashboard-style clients use aligned boundaries, and a
- * mid-minute range is by nature a narrow one.
+ * Range alignment is *not* a condition. Rollup rows are whole minutes, so a
+ * range with a mid-minute boundary is split: the partial minutes at each end
+ * read the raw table and the whole minutes in between read the rollup. See
+ * `rollupRange`.
  */
 export function canUseRollup(params: AggregateParams): boolean {
   const hasAttributeFilter = Object.keys(params.filters.attributes).length > 0;
 
-  if (hasAttributeFilter || params.filters.q !== undefined) {
-    return false;
-  }
+  return !hasAttributeFilter && params.filters.q === undefined;
+}
 
-  const sinceAligned = params.since.getTime() % MINUTE_MS === 0;
-  const untilAligned = params.until.getTime() % MINUTE_MS === 0;
+export interface RollupRange {
+  /** First whole minute the rollup covers, inclusive. */
+  readonly rollupSince: Date;
+  /** End of rollup coverage, exclusive. */
+  readonly rollupUntil: Date;
+  /** True when at least one whole minute falls inside the range. */
+  readonly hasRollupSpan: boolean;
+}
 
-  return sinceAligned && untilAligned;
+/**
+ * Splits a requested range at minute boundaries.
+ *
+ * `since` rounds *up* and `until` rounds *down*, so the rollup covers only
+ * minutes wholly inside the request. Whatever falls outside — at most one
+ * partial minute at each end — is counted from the raw table.
+ *
+ * A range shorter than a minute, or one that spans no whole minute, has no
+ * rollup span at all and is answered entirely from raw rows. That is cheap by
+ * construction: such a range is under two minutes wide.
+ */
+export function rollupRange(params: AggregateParams): RollupRange {
+  const sinceMs = params.since.getTime();
+  const untilMs = params.until.getTime();
+
+  const rollupSinceMs = Math.ceil(sinceMs / MINUTE_MS) * MINUTE_MS;
+  const rollupUntilMs = Math.floor(untilMs / MINUTE_MS) * MINUTE_MS;
+
+  return {
+    rollupSince: new Date(rollupSinceMs),
+    rollupUntil: new Date(rollupUntilMs),
+    hasRollupSpan: rollupUntilMs > rollupSinceMs,
+  };
 }
