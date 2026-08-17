@@ -113,6 +113,11 @@ export class LogBatcher {
     }
   }
 
+  /** Queued entries not yet written. Lets background jobs yield under load. */
+  queueDepth(): number {
+    return this.pending.length;
+  }
+
   private scheduleFlush(): void {
     if (this.timer !== undefined) {
       return;

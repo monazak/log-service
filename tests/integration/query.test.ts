@@ -25,7 +25,7 @@ afterAll(async () => {
   }
 });
 
-async function query(qs: string) {
+function query(qs: string) {
   return h.app.inject({ method: "GET", url: `/logs?service=${SERVICE}&${qs}` });
 }
 

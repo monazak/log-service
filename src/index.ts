@@ -88,7 +88,7 @@ try {
 
   partitionTimer = startPartitionScheduler(app, pool);
   retentionTimer = startRetentionScheduler(app, pool, config.retentionDays);
-  rollupTimer = startRollupScheduler(app, pool);
+  rollupTimer = startRollupScheduler(app, pool, batcher);
 } catch (error) {
   app.log.error(error, "Failed to start service");
   await pool.end().catch(() => {});

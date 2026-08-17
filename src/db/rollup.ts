@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
+import type { LogBatcher } from "./batcher.ts";
 
-const INTERVAL_MS = 3_000;
+const INTERVAL_MS = 30_000;
 
 /**
  * Rollup maintenance.
@@ -25,14 +26,19 @@ export async function refreshRollup(pool: pg.Pool): Promise<number> {
 export function startRollupScheduler(
   app: FastifyInstance,
   pool: pg.Pool,
+  batcher: LogBatcher,
 ): NodeJS.Timeout {
   const timer = setInterval(() => {
+    if (batcher.queueDepth() > 0) {
+      return;
+    }
+
     const started = Date.now();
 
     refreshRollup(pool)
       .then((rows) => {
         if (rows > 0) {
-          app.log.info({ rows, ms: Date.now() - started }, "Rollup refreshed");
+          app.log.debug({ rows, ms: Date.now() - started }, "Rollup refreshed");
         }
       })
       .catch((error: unknown) => {

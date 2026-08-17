@@ -33,6 +33,12 @@ services:
       - "statement_timeout=60s"
       - "-c"
       - "effective_io_concurrency=200"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "bgwriter_delay=500ms"
+      - "-c"
+      - "bgwriter_lru_maxpages=100"
     environment:
       POSTGRES_USER: logservice
       POSTGRES_PASSWORD: logservice
