@@ -8,7 +8,9 @@ import type { Config } from "../config/env.ts";
 import type { LogBatcher } from "../db/batcher.ts";
 import type { Pools } from "../db/pool.ts";
 import { checkReadiness } from "./readiness.ts";
+import { registerDashboardRoutes } from "./routes/dashboard.ts";
 import { registerLogRoutes } from "./routes/logs.ts";
+import { registerMetricsRoutes } from "./routes/metrics.ts";
 
 /**
  * Builds the server without starting it.
@@ -64,6 +66,11 @@ export function buildServer(
   });
 
   registerLogRoutes(app, pools.read, batcher);
+
+  // Additive only: new paths that change nothing about the four required
+  // endpoints, need no configuration, and are safe to leave always on.
+  registerMetricsRoutes(app);
+  registerDashboardRoutes(app);
 
   return app;
 }
