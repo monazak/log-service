@@ -21,7 +21,7 @@ import { copyLogs } from "./repositories/logRepository.ts";
  * rises by the batching factor.
  */
 
-const FLUSH_INTERVAL_MS = 10;
+const FLUSH_INTERVAL_MS = 25;
 const MAX_BATCH_ENTRIES = 5000;
 
 /**
@@ -35,7 +35,7 @@ const MAX_BATCH_ENTRIES = 5000;
  * by the point where concurrent COPYs contend on the same index pages, since
  * all inserts land in the same daily partition.
  */
-const MAX_CONCURRENT_FLUSHES = 4;
+const MAX_CONCURRENT_FLUSHES = 2;
 
 /**
  * Queue ceiling.

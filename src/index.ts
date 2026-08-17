@@ -95,6 +95,21 @@ try {
   rollupTimer = startRollupScheduler(app, pools.write, batcher);
 } catch (error) {
   app.log.error(error, "Failed to start service");
+
+  // Timers may already be running, and the batcher may hold entries whose
+  // flush is scheduled. Without clearing them the process spends its final
+  // moments logging "cannot use a pool after end" once per flush interval,
+  // burying the actual startup error under hundreds of lines.
+  if (partitionTimer !== undefined) {
+    clearInterval(partitionTimer);
+  }
+  if (retentionTimer !== undefined) {
+    clearInterval(retentionTimer);
+  }
+  if (rollupTimer !== undefined) {
+    clearInterval(rollupTimer);
+  }
+
   await closePools(pools).catch(() => {});
   process.exit(1);
 }
