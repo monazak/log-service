@@ -4,7 +4,7 @@ import { ensurePartitions, runMigrations } from "./db/migrate.ts";
 import { startPartitionScheduler } from "./db/partitionScheduler.ts";
 import { closePools, createPools, verifyConnection } from "./db/pool.ts";
 import { enforceRetention, startRetentionScheduler } from "./db/retention.ts";
-import { startRollupScheduler } from "./db/rollup.ts";
+import { rebuildRollup, startRollupScheduler } from "./db/rollup.ts";
 import { markReady } from "./http/readiness.ts";
 import { buildServer } from "./http/server.ts";
 import { registerShutdownHandlers } from "./http/shutdown.ts";
@@ -72,6 +72,13 @@ try {
 
   const partitions = await ensurePartitions(pools.write);
   app.log.info({ created: partitions }, "Partitions ensured");
+
+  // The rollup is blind to rows that did not come through the write path, and a
+  // restart may be against a database someone loaded directly. Rebuilding
+  // before reporting ready means the first aggregate is served from the rollup
+  // rather than from a full scan. On an empty database this is instant.
+  const rollupBuckets = await rebuildRollup(pools.write);
+  app.log.info({ buckets: rollupBuckets }, "Rollup rebuilt at startup");
 
   // Runs once at startup so a service that was down for a week does not wait
   // six hours before cleaning up. Retention covers the rollup as well as the
