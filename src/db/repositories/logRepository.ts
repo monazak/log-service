@@ -408,30 +408,121 @@ async function insertChunk(
   return result.rowCount ?? 0;
 }
 
+/**
+ * Time windows tried, newest first, before giving up on the ordered index scan.
+ *
+ * Only used for filters no index can order by. See `queryLogs`.
+ */
+const STAGED_WINDOWS_MS = [60 * 60 * 1000, 24 * 60 * 60 * 1000];
+
+/** One page of `logs`, optionally floored in time or planned behind a fence. */
+async function queryPage(
+  pool: pg.Pool,
+  filters: LogFilters,
+  cursor: CursorPosition | undefined,
+  floor: Date | undefined,
+  fenced: boolean,
+): Promise<LogRow[]> {
+  const scoped = floor === undefined ? filters : { ...filters, since: floor };
+  const where = buildWhereClause(scoped, cursor);
+
+  // limit + 1 detects whether another page exists without a second COUNT query.
+  const limitPlaceholder = `$${where.values.length + 1}`;
+
+  // `OFFSET 0` blocks subquery pull-up, which is the whole point: it stops the
+  // planner from satisfying the ORDER BY with a backward index scan and forces
+  // it to select rows by the filter first — a bitmap scan over the GIN or
+  // trigram index — and sort the few that match.
+  const sql = fenced
+    ? `
+    SELECT * FROM (
+      SELECT id, "timestamp", level, service, message, attributes
+      FROM logs
+      ${where.sql}
+      OFFSET 0
+    ) matched
+    ORDER BY "timestamp" DESC, id DESC
+    LIMIT ${limitPlaceholder}
+  `
+    : `
+    SELECT id, "timestamp", level, service, message, attributes
+    FROM logs
+    ${where.sql}
+    ORDER BY "timestamp" DESC, id DESC
+    LIMIT ${limitPlaceholder}
+  `;
+
+  const result = await pool.query<LogRow>(sql, [...where.values, filters.limit + 1]);
+
+  return result.rows;
+}
+
+/**
+ * Reads one page of logs, newest first.
+ *
+ * Most filters are served directly: `service`, `level`, and time ranges all
+ * narrow the same index the ORDER BY walks, so Postgres reads rows in order and
+ * stops at the limit.
+ *
+ * `attr.<key>` and `q` are the two that cannot be. Neither the GIN index on
+ * attributes nor the trigram index on messages carries any ordering, so the
+ * planner has a choice: select by the filter and sort what matches, or walk the
+ * time index backwards and test each row. It estimates `@>` and `ILIKE` at a
+ * flat fraction of the table regardless of the value, so for a selective filter
+ * it takes the second option expecting to fill the limit within a few thousand
+ * rows — and then walks every row in the table instead. Measured: a filter
+ * matching one row of three million took 3 s and hit the statement timeout,
+ * which the caller sees as a 500.
+ *
+ * So those two are staged. Each window is tried newest-first with the ordinary
+ * plan, and a window that fills the page is the answer — everything excluded is
+ * strictly older than everything returned, which is exactly what the ordering
+ * asks. A broad filter fills the first window immediately and pays a bounded
+ * scan for it.
+ *
+ * Reaching the end of the windows is itself the evidence that the filter is
+ * selective: nothing matched across a whole day. Only then is the full range
+ * planned behind a fence, where sorting the matches is the cheap option
+ * precisely because there are so few of them.
+ */
 export async function queryLogs(
   pool: pg.Pool,
   filters: LogFilters,
   cursor?: CursorPosition,
 ): Promise<{ rows: LogRow[]; hasMore: boolean }> {
-  const where = buildWhereClause(filters, cursor);
+  const page = (rows: LogRow[]): { rows: LogRow[]; hasMore: boolean } => {
+    const hasMore = rows.length > filters.limit;
 
-  // limit + 1 detects whether another page exists without a second COUNT query.
-  const sql = `
-    SELECT id, "timestamp", level, service, message, attributes
-    FROM logs
-    ${where.sql}
-    ORDER BY "timestamp" DESC, id DESC
-    LIMIT $${where.values.length + 1}
-  `;
+    return { rows: hasMore ? rows.slice(0, filters.limit) : rows, hasMore };
+  };
 
-  const values = [...where.values, filters.limit + 1];
+  const unordered =
+    filters.q !== undefined || Object.keys(filters.attributes).length > 0;
 
-  const result = await pool.query<LogRow>(sql, values);
+  if (!unordered) {
+    return page(await queryPage(pool, filters, cursor, undefined, false));
+  }
 
-  const hasMore = result.rows.length > filters.limit;
-  const rows = hasMore ? result.rows.slice(0, filters.limit) : result.rows;
+  // Newest row the page could contain: the cursor if paginating, else `until`.
+  const upper = cursor?.timestamp ?? filters.until ?? new Date();
 
-  return { rows, hasMore };
+  for (const window of STAGED_WINDOWS_MS) {
+    const floor = new Date(upper.getTime() - window);
+
+    // The caller's own lower bound is already inside this window, so the
+    // window is the whole range and there is nothing left to widen to.
+    if (filters.since !== undefined && floor <= filters.since) {
+      break;
+    }
+
+    const rows = await queryPage(pool, filters, cursor, floor, false);
+
+    if (rows.length > filters.limit) {
+      return page(rows);
+    }
+  }
+
+  return page(await queryPage(pool, filters, cursor, undefined, true));
 }
 
 export async function aggregateLogs(
