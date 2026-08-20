@@ -21,3 +21,4 @@ npm-debug.log*
 # Editors
 .vscode/
 .idea/benchmark-report.json
+benchmark-report.json

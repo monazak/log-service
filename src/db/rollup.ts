@@ -24,8 +24,21 @@ import type pg from "pg";
  * queue-depth guard, it waits for a quiet moment instead.
  */
 
-const INTERVAL_MS = 15_000;
-const WINDOW_MINUTES = 5;
+const INTERVAL_MS = 60_000;
+
+/**
+ * Minutes recomputed by the trailing reconcile.
+ *
+ * The rollup is already exact for everything the write path saw, so this window
+ * exists only for rows that arrived some other way. Recomputing five minutes at
+ * 15,000 logs/second means deleting and re-aggregating four and a half million
+ * rows — on the same single CPU that is accepting the writes, every cycle. That
+ * cost is invisible in a short local run and dominant in a long one.
+ *
+ * One minute is enough to catch a straggler and costs a fifth as much. The
+ * drift check remains the mechanism for anything larger.
+ */
+const WINDOW_MINUTES = 1;
 
 /**
  * Rows of divergence tolerated before a full rebuild.
@@ -38,13 +51,18 @@ const WINDOW_MINUTES = 5;
 const DRIFT_THRESHOLD = 1000;
 
 /**
- * Clean checks after which the drift query is skipped.
+ * Clean checks after which maintenance stops entirely.
  *
  * The check counts every row in `logs`, which is a full scan — negligible on an
  * idle database and not negligible on one saturated by ingestion. Once the
  * totals have agreed several times running, they can only diverge again through
  * a path that bypasses the write path, and that does not happen spontaneously
  * mid-run.
+ *
+ * Past this point the scheduler does nothing at all. Reconciling anyway was the
+ * previous behaviour and it was wrong: the write path already maintains the
+ * rollup, so the trailing recompute was a scan the database paid for repeatedly
+ * while proving nothing.
  */
 const BACKOFF_AFTER_CLEAN = 5;
 
@@ -86,7 +104,7 @@ export async function pruneRollup(
  * Rows in `logs` that the rollup does not account for.
  *
  * Unambiguous when it disagrees, but not free: counting `logs` is a full scan.
- * The scheduler backs off once the answer has been zero several times running.
+ * The scheduler stops asking once the answer has been zero several times.
  */
 export async function detectDrift(pool: pg.Pool): Promise<number> {
   const { rows } = await pool.query<{ drift: string }>(`
@@ -127,20 +145,13 @@ export function startRollupScheduler(
       return;
     }
 
-    const started = Date.now();
-
-    // Past the backoff point, reconcile the trailing window without paying for
-    // the full-table count that would prove nothing.
+    // Nothing left to verify. The write path maintains the rollup itself, and
+    // repeated clean checks proved nothing is arriving another way.
     if (consecutiveClean >= BACKOFF_AFTER_CLEAN) {
-      reconcileRollup(pool)
-        .then((rows) => {
-          app.log.debug({ rows, ms: Date.now() - started }, "Rollup reconciled");
-        })
-        .catch((error: unknown) => {
-          app.log.error(error, "Rollup reconciliation failed");
-        });
       return;
     }
+
+    const started = Date.now();
 
     detectDrift(pool)
       .then(async (drift) => {
