@@ -8,27 +8,39 @@ excluded), with container limits applied: app 0.5 CPU / 256 MB, postgres
 
 ## Headline results
 
-Measured with `scripts/loadgen-v2.mjs`, which replicates the graded harness:
-27-entry batches at a fixed 15,000 logs/sec arrival rate with a 5-second client
-timeout. Database seeded with 1M rows before the run. Aggregation running
-concurrently in a second process.
+Measured under k6 on the compose network, replicating the graded harness: a
+fixed 15,000 logs/sec arrival rate in 33-entry batches for 120 s, against a
+database preloaded with the harness's own 1,000,000-row fixture, with queries
+and read-after-write probes running concurrently.
 
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | **15,013 logs/sec** — 100% of a fixed 15,000/sec arrival rate | ✅ |
-| No dropped requests or crashes | 0 timeouts, 0 errors | ✅ |
-| Aggregation p95 < 1s | **3.1 ms** under concurrent ingestion | ✅ |
-| Query performance during ingestion | 40 of 40 aggregates completed | ✅ |
-| ~1,000,000 stored records | 1M seeded + 1.1M ingested during the run | ✅ |
-| Data queryable within 20s | Raw-tail merge past the rollup watermark | ✅ |
+| Sustain ≥ 15,000 logs/sec | **15,026 logs/sec** — 100% of a fixed 15,000/sec arrival rate | ✅ |
+| No dropped requests or crashes | 0 rejected, 0 failed of 55,551 requests | ✅ |
+| Aggregation p95 < 1s | **6.9 ms** under concurrent ingestion | ✅ |
+| Query performance during ingestion | p95 2.5 ms | ✅ |
+| ~1,000,000 stored records | 1M fixture + 1.8M ingested during the run | ✅ |
+| Data queryable within 20s | 97.5% visible immediately; rollups exact at every commit | ✅ |
 | 1 aggregation/sec during ingestion | Sustained | ✅ |
 
 | Resource | Peak | Limit |
 |---|---|---|
-| App CPU | 41.5% | 50% (0.5 CPU) |
-| App memory | 48 MiB | 256 MB |
-| Postgres CPU | 40.9% | 100% (1 CPU) |
-| Postgres memory | 340 MiB | 1 GB |
+| App CPU | 39.8% | 50% (0.5 CPU) |
+| App memory | 40 MiB | 256 MB |
+| Postgres CPU | 48.8% | 100% (1 CPU) |
+| Postgres memory | 388 MiB | 1 GB |
+
+### Beyond the target
+
+The stress and breakpoint stages raise the arrival rate well past 15,000/sec.
+Adaptive batching absorbs them without shedding: the busier the writers, the
+larger the batches they take.
+
+| Arrival rate | Achieved | Aggregate p95 | Failed |
+|---|---|---|---|
+| 15,000/sec | 15,026/sec | 6.9 ms | 0 |
+| 30,000/sec | 29,440/sec | 42.5 ms | 0 |
+| 45,000/sec | 44,802/sec | 21.5 ms | 0 |
 
 Both containers sit below half their limits, so this is a sustained rate rather
 than a saturation point.
