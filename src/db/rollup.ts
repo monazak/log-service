@@ -27,16 +27,10 @@ import type pg from "pg";
 const INTERVAL_MS = 60_000;
 
 /**
- * Minutes recomputed by the trailing reconcile.
+ * Default window for a manual reconcile.
  *
- * The rollup is already exact for everything the write path saw, so this window
- * exists only for rows that arrived some other way. Recomputing five minutes at
- * 15,000 logs/second means deleting and re-aggregating four and a half million
- * rows — on the same single CPU that is accepting the writes, every cycle. That
- * cost is invisible in a short local run and dominant in a long one.
- *
- * One minute is enough to catch a straggler and costs a fifth as much. The
- * drift check remains the mechanism for anything larger.
+ * Only used by callers that ask for one. The scheduler no longer reconciles on
+ * a timer: see `startRollupScheduler`.
  */
 const WINDOW_MINUTES = 1;
 
@@ -58,11 +52,6 @@ const DRIFT_THRESHOLD = 1000;
  * totals have agreed several times running, they can only diverge again through
  * a path that bypasses the write path, and that does not happen spontaneously
  * mid-run.
- *
- * Past this point the scheduler does nothing at all. Reconciling anyway was the
- * previous behaviour and it was wrong: the write path already maintains the
- * rollup, so the trailing recompute was a scan the database paid for repeatedly
- * while proving nothing.
  */
 const BACKOFF_AFTER_CLEAN = 5;
 
@@ -166,10 +155,21 @@ export function startRollupScheduler(
           return;
         }
 
+        // Agreement is the whole result. There is deliberately no reconcile
+        // here: the write path maintains the rollup transactionally, so a
+        // trailing recompute cannot find anything the count just proved absent,
+        // and it is not cheap — `reconcile_log_rollup` deletes and re-aggregates
+        // its window from the raw table, which at 15,000 logs/second is nearly
+        // two million rows per cycle, competing with ingestion for the one CPU.
+        //
+        // It was also unsafe. The recompute deletes the window's rollup rows and
+        // re-inserts them in a second statement; a batch committing between the
+        // two re-creates a row the delete removed, and the insert then fails on
+        // the primary key. Running it only when the totals actually disagree
+        // removes both problems.
         consecutiveClean += 1;
 
-        const rows = await reconcileRollup(pool);
-        app.log.debug({ rows, ms: Date.now() - started }, "Rollup reconciled");
+        app.log.debug({ drift, ms: Date.now() - started }, "Rollup agrees with logs");
       })
       .catch((error: unknown) => {
         app.log.error(error, "Rollup reconciliation failed");

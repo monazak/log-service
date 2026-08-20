@@ -15,9 +15,9 @@ concurrently in a second process.
 
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | **18,950 logs/sec** | ✅ |
+| Sustain ≥ 15,000 logs/sec | **15,013 logs/sec** — 100% of a fixed 15,000/sec arrival rate | ✅ |
 | No dropped requests or crashes | 0 timeouts, 0 errors | ✅ |
-| Aggregation p95 < 1s | **197 ms** under concurrent ingestion | ✅ |
+| Aggregation p95 < 1s | **3.1 ms** under concurrent ingestion | ✅ |
 | Query performance during ingestion | 40 of 40 aggregates completed | ✅ |
 | ~1,000,000 stored records | 1M seeded + 1.1M ingested during the run | ✅ |
 | Data queryable within 20s | Raw-tail merge past the rollup watermark | ✅ |
@@ -547,6 +547,10 @@ timeouts out of 5,311 requests: past the sustainable point, not a usable rate.
 The reported figure is the 27-entry measurement, which is also the graded batch
 size.
 
+> Everything above this line predates the aggregate-query fix described in
+> "The reader was the bottleneck" below, and is kept as the record of what was
+> measured at the time. The current figures are in Headline results.
+
 ---
 
 ## Latency tails
@@ -662,3 +666,145 @@ Recorded so the gaps are explicit rather than implied.
 
 - **Numbers were measured on macOS via Docker Desktop's Linux VM.** Native Linux
   should perform better; these figures are conservative.
+
+---
+
+## The reader was the bottleneck
+
+A graded run reported 3,550 logs/sec against a 15,000/sec target, with Postgres
+pinned near 100% CPU and the application at 7%. Every earlier round of this
+document had treated a saturated database as a *write* problem. This one was not.
+
+The metric that gave it away was in the same report: ingestion latency p95 of
+713 ms, but aggregate p95 of **4.11 s**. The slow thing was not the writes.
+
+### What the aggregate was doing
+
+Rollup rows are whole minutes, and a request whose range ends mid-minute cannot
+take the last row whole. The query therefore read that final fraction of a minute
+from the raw table, one row per log.
+
+Reproduced locally under a 15,000/sec run:
+
+```
+->  Index Only Scan using logs_2026_08_20_pkey  (actual rows=658515)
+      Heap Fetches: 658944
+Execution Time: 438.825 ms
+```
+
+658,515 rows, for one request, for one partial minute. At one or two aggregates
+per second that is most of a CPU spent counting rows that a single rollup row
+already counted — on the one CPU ingestion also needed. The two were not
+independently slow; the reader was starving the writer.
+
+The cost also grows with the ingest rate, which is why it was invisible in the
+short local runs used earlier: the faster ingestion got, the more rows each
+aggregate had to scan.
+
+### Answering partial minutes from the rollup
+
+A rollup row for a minute counts the whole minute. It is therefore an exact
+answer for a *part* of that minute precisely when the minute holds no rows
+outside the requested part — and for `until = now`, the part beyond `until` is
+the future, which is empty.
+
+That condition is checked in the same statement, so the query stays atomic. Both
+branches are emitted under complementary conditions and Postgres evaluates the
+condition once as an InitPlan, so the raw branch is planned and never executed:
+
+```
+->  Result  (actual rows=20)
+      One-Time Filter: (NOT (InitPlan 1).col1)
+      ->  Index Scan using log_rollup_1m_bucket_idx  (actual rows=20)
+->  Index Only Scan using logs_2026_08_20_pkey  (never executed)
+Execution Time: 0.321 ms
+```
+
+438 ms to 0.32 ms, same answer.
+
+### The probe planned as a sequential scan
+
+The first version of that condition was an `EXISTS`, and it made the endpoint
+*slower* — 690 ms per request, while the same SQL run by hand took 0.3 ms. The
+plan showed why:
+
+```
+->  Seq Scan on logs_2026_08_20  (actual time=696.752..696.752 rows=0)
+```
+
+`EXISTS` tells the planner it may stop at the first matching row, so a sequential
+scan looks cheap: it expects to find one immediately. But the answer this probe
+wants is normally *no row*, and proving a range empty by sequential scan means
+reading the entire partition — 78,231 buffers to clear one minute.
+
+`ORDER BY "timestamp" LIMIT 1` does not fix it, because ordering is meaningless
+to `EXISTS` and the planner discards it. Rewriting the probe as
+`(SELECT min("timestamp") FROM logs WHERE ...) IS NOT NULL` does: `min()` over an
+indexed column is rewritten into "walk the index, take the first row", a plan
+with no sequential-scan fallback.
+
+```
+->  Limit  (actual time=0.091..0.091 rows=0)
+      ->  Index Only Scan using logs_2026_08_20_pkey
+Execution Time: 0.174 ms
+```
+
+0.048 ms when a `service` filter lets it use the service index instead.
+
+### Results
+
+Clean database, the harness's own 1,000,000-row fixture loaded through
+`POST /logs`, 120 seconds at a fixed 15,000/sec arrival rate, with two aggregates
+and two log queries per second running throughout.
+
+| Metric | Before | After |
+|---|---|---|
+| Throughput | 3,550 logs/sec | **15,013 logs/sec** |
+| Aggregate p95 | 4.11 s | **3.1 ms** |
+| Ingestion latency p95 | 713 ms | **14.9 ms** |
+| `GET /logs` p95 | — | **2.2 ms** |
+| Read-after-write visibility | 0.94% | **51%** |
+| Postgres CPU | 78% avg, 101% peak | **19%** |
+| Errors / rejected | 0 | **0** |
+
+Aggregation also stopped degrading with run length, which was the other half of
+the symptom: over 120 seconds it averages 8.6 ms with a worst case of 24.9 ms,
+where before it drifted from milliseconds into seconds as the dataset grew.
+
+The staged profiles pass on the same build, with no errors and no rejected
+batches:
+
+| Profile | Stages | Achieved | Aggregate p95 |
+|---|---|---|---|
+| Stress | 15k → 22.5k → 30k | 20,976 logs/sec | 13.0 ms |
+| Spike | 7.5k → 30k → 7.5k | 15,360 logs/sec | 41.9 ms |
+| Breakpoint | 15k → 22.5k → 30k → 45k | 24,267 logs/sec | 198 ms |
+
+### Two smaller findings from the same run
+
+**The flush interval decides read-after-write visibility.** Everything accepted
+while a caller waits in the batcher is ordered ahead of that caller's own row, so
+the wait does not merely delay the acknowledgement — it buries the record under
+whatever arrived during it. At 15,000 logs/sec, against `GET /logs?limit=100`:
+
+| Flush interval | Ingest p95 | Record still visible |
+|---|---|---|
+| 25 ms | 31 ms | 22% |
+| 10 ms | 15 ms | **61%** |
+
+Throughput is identical at both, because the concurrency cap and not the timer
+is what sizes batches under load. Raising that cap from two to four undoes it:
+the timer keeps firing small transactions, and at 45,000 logs/sec the
+per-transaction overhead pushed the application into its 0.5 CPU limit —
+41,565 logs/sec at 920 ms p95, against 44,567 at 197 ms with two.
+
+**Autovacuum needs the workers it has, not more.** `log_rollup_1m` takes ~2,000
+counter updates per second and was measured holding 88 live rows across 1,944 kB
+of mostly dead pages, vacuumed once in two minutes: the single autovacuum worker
+was permanently busy on a log partition crossing its insert-vacuum threshold
+every few thousand rows. Raising `autovacuum_max_workers` to 3 with a 5-second
+naptime made it dramatically *worse* — 6.08 s aggregate p95 and Postgres pinned
+at 102% — because the extra workers spent their time rescanning a multi-gigabyte
+partition and evicting the buffers ingestion was using. Reverted. The rollup's
+bloat turned out not to be what was costing the aggregate anything anyway; the
+sequential scan above was.

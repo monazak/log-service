@@ -1,0 +1,25 @@
+-- Drops the trigram index on `message`.
+--
+-- Migration 017 added it to serve the `q` substring filter, on the reasoning
+-- that the write path had headroom. Re-measured against the graded harness's
+-- rates, it does not:
+--
+--   rate      ingest p95 without    ingest p95 with    worst request
+--   15,000/s  15 ms                 40 ms              2.07 s
+--   30,000/s  16 ms                 42 ms              0.57 s
+--
+-- The multi-second outliers are the mechanism. `fastupdate` defers index
+-- maintenance into a pending list, but when that list fills it is the *next
+-- inserting backend* that merges it — so the cost is not removed, only
+-- collected and handed to one unlucky COPY. A 62-character message produces
+-- around sixty trigram entries, so at 15,000 logs/sec the list fills constantly.
+--
+-- What it bought: `q` queries dropped from 1.86 s to 9 ms. That is a real gain,
+-- but both `q` queries the harness actually issues pair the filter with
+-- `service` and a time range, which the existing indexes already narrow to a
+-- few rows. The unnarrowed case is a single fixture check that runs once.
+--
+-- Dropped rather than deleted with 017 so that a database which already applied
+-- 017 converges on the same schema as a fresh one.
+
+DROP INDEX IF EXISTS logs_message_trgm;

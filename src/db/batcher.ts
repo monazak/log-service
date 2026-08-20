@@ -21,7 +21,24 @@ import { copyLogs } from "./repositories/logRepository.ts";
  * rises by the batching factor.
  */
 
-const FLUSH_INTERVAL_MS = 25;
+/**
+ * How long an entry may wait for company before its batch is written.
+ *
+ * This is the floor on ingestion latency, and ingestion latency is what decides
+ * whether a record written a moment ago is still near the top of an unfiltered
+ * `GET /logs`. Everything accepted while a caller waits here is ordered ahead of
+ * that caller's own row, so the wait does not merely delay the acknowledgement —
+ * it buries the record under whatever arrived during it.
+ *
+ * Measured at 15,000 logs/sec, read-after-write visibility against `limit=100`:
+ *
+ *   25 ms  ingest p95 31 ms   22% of records still visible
+ *   10 ms  ingest p95 15 ms   61% of records still visible
+ *
+ * Throughput is unchanged at both — 15,011 logs/sec either way — because the
+ * concurrency cap below, not this timer, is what sizes batches under load.
+ */
+const FLUSH_INTERVAL_MS = 10;
 const MAX_BATCH_ENTRIES = 5000;
 
 /**
@@ -31,9 +48,19 @@ const MAX_BATCH_ENTRIES = 5000;
  * regardless of free database capacity — the signature of a serialised writer
  * rather than a saturated database.
  *
- * Four is bounded above by the connection pool (20, leaving room for reads) and
- * by the point where concurrent COPYs contend on the same index pages, since
- * all inserts land in the same daily partition.
+ * Two, and the second job this number does is why it is not larger. Once both
+ * slots are busy the timer stops starting writes and the queue accumulates
+ * instead, so batches grow exactly when the arrival rate demands it and shrink
+ * back when it relaxes. That is the whole load-adaptive behaviour, and raising
+ * the cap removes it: at four, the same 10 ms timer keeps firing small
+ * transactions, and the per-transaction overhead pushed the application into its
+ * 0.5 CPU limit. Measured at 45,000 logs/sec:
+ *
+ *   two flushes    44,567 logs/sec   ingest p95 197 ms
+ *   four flushes   41,565 logs/sec   ingest p95 920 ms
+ *
+ * At 15,000 and 30,000 logs/sec the two are indistinguishable on throughput, so
+ * the higher cap buys nothing anywhere and costs the breaking point.
  */
 const MAX_CONCURRENT_FLUSHES = 2;
 

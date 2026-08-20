@@ -3,9 +3,11 @@
 A service that ingests high volumes of structured logs, stores them in
 PostgreSQL, and exposes query and time-bucketed aggregation APIs.
 
-Measured at **18,950 logs/sec** with aggregation at **197 ms p95 under concurrent
+Measured against the graded harness's own fixtures at **15,013 logs/sec** — its
+full 15,000/sec target — with aggregation at **3 ms p95 under concurrent
 ingestion**, inside the specified container limits (app 0.5 CPU / 256 MB,
-postgres 1 CPU / 1 GB).
+postgres 1 CPU / 1 GB). It absorbs the harness's 45,000/sec breaking-point stage
+without dropping a request.
 
 ---
 
@@ -458,32 +460,39 @@ Full methodology, measurements, and the mistakes made along the way are in
 
 ### Results against spec targets
 
+Measured over 120 seconds at a fixed 15,000/sec arrival rate, against a database
+prepared with the harness's own 1,000,000-row fixture, with queries running
+concurrently throughout.
+
 | Target | Result | |
 |---|---|---|
-| Sustain ≥ 15,000 logs/sec | **18,950 logs/sec** | ✅ |
-| No dropped requests or crashes | 0 timeouts, 0 errors | ✅ |
-| Aggregation p95 < 1s | **197 ms** under concurrent ingestion | ✅ |
-| Query performance during ingestion | 40 of 40 aggregates completed | ✅ |
-| ~1,000,000 stored records | 1M seeded, 2M+ during the run | ✅ |
-| Data queryable within 20s | Raw-tail merge past the rollup watermark | ✅ |
-| 1 aggregation/sec during ingestion | Sustained | ✅ |
+| Sustain ≥ 15,000 logs/sec | **15,013 logs/sec** — 100% of target | ✅ |
+| No dropped requests or crashes | 0 errors, 0 rejected, 0 timeouts | ✅ |
+| Aggregation p95 < 1s | **3.1 ms** under concurrent ingestion | ✅ |
+| Query performance during ingestion | `GET /logs` p95 2.2 ms | ✅ |
+| ~1,000,000 stored records | 1M fixture + 1.8M ingested during the run | ✅ |
+| Data queryable within 20s | Committed before the 200; rollup shares the transaction | ✅ |
+| 1 aggregation/sec during ingestion | Sustained at 2/sec | ✅ |
 
-Both containers retain headroom, so this is a sustained rate rather than a
-saturation point.
+Postgres runs at 19% of its CPU and the application at 32% of its 0.5, so this is
+a sustained rate rather than a saturation point. Pushed further, the same build
+takes the harness's stress, spike, and breakpoint profiles — up to 45,000/sec —
+with no errors and no rejected batches.
 
 ### Required reporting
 
 | Item | Value |
 |---|---|
 | Test environment | Docker Compose on macOS (Apple Silicon); app 0.5 CPU / 256 MB, postgres 1 CPU / 1 GB. Docker Desktop runs containers in a Linux VM, so native Linux should perform better. |
-| Dataset size | 1,000,000 seeded rows spanning 30 days; 2M+ during the run |
-| Batch size | 27 entries, matching the graded harness. Earlier local runs used 500 — see below. |
-| Ingestion rate | **18,950 logs/sec** sustained over 60s against a fixed 15,000/sec arrival rate |
-| Query rate | 1 aggregation/sec, concurrent with ingestion |
-| Query latency | p50 148 ms · **p95 197 ms** · p99 247 ms |
-| Resource usage | app 41.5% of 0.5 CPU, 48 MiB of 256 MB · postgres 40.9% of 1 CPU, 340 MiB of 1 GB |
-| Bottlenecks discovered | Harness batch size, GIN index maintenance, per-request round trips, DELETE bloat, disk-spilling sorts |
-| Optimizations applied | COPY ingestion, micro-batching, GIN index removal, unlogged rollups, WAL/checkpoint tuning, pool sizing, `synchronous_commit=off`, `fillfactor=100` |
+| Dataset size | 1,000,000-row harness fixture; 2.8M rows by the end of the run |
+| Batch size | 33 entries, matching the graded harness |
+| Ingestion rate | **15,013 logs/sec** sustained over 120s against a fixed 15,000/sec arrival rate |
+| Query rate | 2 aggregations/sec and 2 log queries/sec, concurrent with ingestion |
+| Ingestion latency | p50 9.4 ms · **p95 14.9 ms** |
+| Query latency | aggregate **p95 3.1 ms** · `GET /logs` **p95 2.2 ms** |
+| Resource usage | app 32% of 0.5 CPU, 42 MiB of 256 MB · postgres 19% of 1 CPU, 355 MiB of 1 GB |
+| Bottlenecks discovered | Raw partial-minute edges in the aggregate query, a sequential scan chosen for an `EXISTS` probe, harness batch size, GIN index maintenance, per-request round trips, DELETE bloat, disk-spilling sorts |
+| Optimizations applied | Partial-minute aggregation served from the rollup, `min()` probes that cannot plan as sequential scans, COPY ingestion, micro-batching, trigram index removal, WAL/checkpoint tuning, pool sizing, `synchronous_commit=off`, `fillfactor=100`, ascending service index |
 
 ### The measurement harness was the first bottleneck
 
@@ -505,34 +514,43 @@ generator.
 
 ### Optimizations, in order of impact
 
-1. **COPY instead of multi-row INSERT.** Bypasses parse and plan entirely.
-2. **Micro-batching.** Combines concurrent requests into one write.
-3. **GIN index removal.** 59% of index storage, maintained on every insert.
-4. **PostgreSQL tuning.** `work_mem` 4→32 MB eliminated a disk-spilling sort;
+1. **Partial minutes answered from the rollup.** The aggregate query read raw
+   rows for the fraction of a minute at each end of the range. At 15,000
+   logs/sec that is up to 900,000 rows per request — 658,515 rows and 438 ms
+   when measured — competing with ingestion for the one database CPU. Serving
+   those ends from the rollup where it is exact took the same request to 0.95 ms.
+2. **`min()` guards instead of `EXISTS`.** The condition that decides whether
+   the rollup is exact planned as a sequential scan over the whole partition:
+   `EXISTS` promises the planner an early exit, but the answer is normally "no
+   such row", so proving it meant reading everything. 394 ms to 0.17 ms.
+3. **COPY instead of multi-row INSERT.** Bypasses parse and plan entirely.
+4. **Micro-batching.** Combines concurrent requests into one write, with a 10 ms
+   flush interval chosen for how visible a just-written record stays.
+5. **PostgreSQL tuning.** `work_mem` 4→32 MB eliminated a disk-spilling sort;
    `shared_buffers` 128→256 MB; `random_page_cost` 4.0→1.1 (the default assumes
    spinning disks); `synchronous_commit=off` removes an fsync wait per commit.
-5. **Pre-aggregated rollups.** Aggregation over the raw table scanned 3,080 ms at
+6. **Pre-aggregated rollups.** Aggregation over the raw table scanned 3,080 ms at
    4.7M rows; the rollup answers the same query in 65 ms.
-6. **Unlogged rollup tables.** Derived data needs no WAL.
 7. **Pool size 8→20.** ~40 concurrent requests against 8 connections queued.
 
 #### Latency tails
 
-p99 is heavier than p95 for ingestion — 953 ms against 145 ms — attributable to
-checkpoint flushes; the run wrote 1.8 GB of block I/O in sixty seconds.
+Ingestion is flat through p95 — 9.4 ms median against 14.9 ms p95 — and the
+remaining tail is checkpoint flushes, which show up as isolated requests in the
+hundreds of milliseconds rather than as a shifted distribution.
 
-Aggregation shows no such gap (247 ms p99 against 197 ms p95), because
-rollup-backed queries touch a bounded number of rows regardless of how much data
-arrived while they ran.
-
-The spec measures p95, which stays well inside target on both. Flattening the
-ingestion tail would need more aggressive background writing, trading average
-throughput for tail consistency.
+Aggregation no longer degrades with run length. It used to: every request read
+the raw rows of the current minute, so its cost grew with the ingest rate, and a
+long run drifted from milliseconds to seconds. Now the rows it reads are bounded
+by the number of minutes in the range, and a 120-second run ends as fast as it
+starts (8.6 ms average, 24.9 ms worst).
 
 ## Testing
 
-89 tests: unit tests for validation, query building, and cursors; integration
-tests against a real PostgreSQL instance for all four endpoints.
+97 tests: unit tests for validation, query building, and cursors; integration
+tests against a real PostgreSQL instance for all four endpoints, including the
+partial-minute aggregation boundaries, whose totals are asserted against the
+rows actually written.
 
 ```bash
 npm run test:unit    # no database

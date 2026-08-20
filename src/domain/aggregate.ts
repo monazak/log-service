@@ -19,8 +19,6 @@ export type BucketSize = (typeof BUCKET_SIZES)[number];
 export const GROUP_BY_FIELDS = ["service", "level"] as const;
 export type GroupByField = (typeof GROUP_BY_FIELDS)[number];
 
-const MINUTE_MS = 60_000;
-
 export interface AggregateParams {
   readonly filters: LogFilters;
   readonly since: Date;
@@ -106,46 +104,12 @@ export function parseAggregateParams(query: Record<string, unknown>): AggregateR
  * stored at all.
  *
  * Range alignment is *not* a condition. Rollup rows are whole minutes, so a
- * range with a mid-minute boundary is split: the partial minutes at each end
- * read the raw table and the whole minutes in between read the rollup. See
- * `rollupRange`.
+ * range with a mid-minute boundary is split into whole minutes and at most one
+ * partial minute at each end. See `buildRollupAggregateQuery`, which resolves
+ * the partial ends from the rollup too wherever that is exact.
  */
 export function canUseRollup(params: AggregateParams): boolean {
   const hasAttributeFilter = Object.keys(params.filters.attributes).length > 0;
 
   return !hasAttributeFilter && params.filters.q === undefined;
-}
-
-export interface RollupRange {
-  /** First whole minute the rollup covers, inclusive. */
-  readonly rollupSince: Date;
-  /** End of rollup coverage, exclusive. */
-  readonly rollupUntil: Date;
-  /** True when at least one whole minute falls inside the range. */
-  readonly hasRollupSpan: boolean;
-}
-
-/**
- * Splits a requested range at minute boundaries.
- *
- * `since` rounds *up* and `until` rounds *down*, so the rollup covers only
- * minutes wholly inside the request. Whatever falls outside — at most one
- * partial minute at each end — is counted from the raw table.
- *
- * A range shorter than a minute, or one that spans no whole minute, has no
- * rollup span at all and is answered entirely from raw rows. That is cheap by
- * construction: such a range is under two minutes wide.
- */
-export function rollupRange(params: AggregateParams): RollupRange {
-  const sinceMs = params.since.getTime();
-  const untilMs = params.until.getTime();
-
-  const rollupSinceMs = Math.ceil(sinceMs / MINUTE_MS) * MINUTE_MS;
-  const rollupUntilMs = Math.floor(untilMs / MINUTE_MS) * MINUTE_MS;
-
-  return {
-    rollupSince: new Date(rollupSinceMs),
-    rollupUntil: new Date(rollupUntilMs),
-    hasRollupSpan: rollupUntilMs > rollupSinceMs,
-  };
 }
