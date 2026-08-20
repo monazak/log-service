@@ -38,7 +38,14 @@ import { copyLogs } from "./repositories/logRepository.ts";
  * Throughput is unchanged at both — 15,011 logs/sec either way — because the
  * concurrency cap below, not this timer, is what sizes batches under load.
  */
-const FLUSH_INTERVAL_MS = 10;
+/**
+ * How long entries wait for company when every writer is already busy.
+ *
+ * A backstop rather than the normal path: `submit` writes immediately whenever
+ * a writer is free, so this timer only runs while all of them are in flight and
+ * the queue is accumulating anyway.
+ */
+const FLUSH_INTERVAL_MS = 5;
 const MAX_BATCH_ENTRIES = 5000;
 
 /**
@@ -120,7 +127,26 @@ export class LogBatcher {
       this.pending.push(...entries);
       this.waiters.push({ resolve, reject });
 
-      if (this.pending.length >= MAX_BATCH_ENTRIES) {
+      // Write now if a writer is free, rather than holding the batch for a
+      // fixed interval.
+      //
+      // A timer sets ingestion latency to roughly half its period however idle
+      // the database is, and that latency is not only the caller's: it is also
+      // how long the record stays invisible to a read that follows the write.
+      // At 15,000 logs/sec every millisecond of it is fifteen newer rows ahead
+      // of the caller's own in a time-ordered page, which is what holds
+      // read-after-write down near half.
+      //
+      // Batching still happens, and still grows with load, because it now forms
+      // where it actually saves something: while every writer is busy, arrivals
+      // accumulate and the next flush takes all of them. Under saturation that
+      // is the same large batch the timer produced; at moderate rates it is a
+      // small one, which is right, because at moderate rates there is spare
+      // capacity and nothing to amortise.
+      if (
+        this.pending.length >= MAX_BATCH_ENTRIES ||
+        this.activeFlushes < MAX_CONCURRENT_FLUSHES
+      ) {
         void this.flush();
         return;
       }

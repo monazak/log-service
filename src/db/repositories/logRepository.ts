@@ -180,6 +180,13 @@ function foldToMinutes(seconds: readonly RollupDelta[]): RollupDelta[] {
  * still disagree. Ordering in SQL hands the decision to Postgres, which applies
  * one collation to both.
  *
+ * The counters arrive as four parallel arrays through `unnest` rather than as a
+ * VALUES list, because that keeps the SQL text identical from one flush to the
+ * next however many buckets a batch touched. A named statement with constant
+ * text is parsed and planned once per connection and executed thereafter, which
+ * matters here: the flush interval is short by design, so this runs hundreds of
+ * times a second and its fixed cost is most of its cost.
+ *
  * The table name is a literal chosen by the caller from the two below, never a
  * value derived from a request.
  */
@@ -192,27 +199,32 @@ async function applyRollupDeltas(
     return;
   }
 
-  const values: unknown[] = [];
-  const rows: string[] = [];
+  const buckets: Date[] = [];
+  const services: string[] = [];
+  const levels: string[] = [];
+  const counts: number[] = [];
 
   for (const delta of deltas) {
-    const base = values.length;
-    rows.push(
-      `($${base + 1}::timestamptz, $${base + 2}::text, $${base + 3}::text, $${base + 4}::bigint)`,
-    );
-    values.push(delta.bucket, delta.service, delta.level, delta.count);
+    buckets.push(delta.bucket);
+    services.push(delta.service);
+    levels.push(delta.level);
+    counts.push(delta.count);
   }
 
   await client.query(
-    `
+    {
+      name: `upsert_${table}`,
+      text: `
       INSERT INTO ${table} (bucket, service, level, count)
       SELECT bucket, service, level, count
-      FROM (VALUES ${rows.join(", ")}) AS batch (bucket, service, level, count)
+      FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::bigint[])
+        AS batch (bucket, service, level, count)
       ORDER BY bucket, service, level
       ON CONFLICT (bucket, service, level)
       DO UPDATE SET count = ${table}.count + EXCLUDED.count
     `,
-    values,
+    },
+    [buckets, services, levels, counts],
   );
 }
 
