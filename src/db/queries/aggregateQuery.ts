@@ -52,6 +52,17 @@ const GROUP_COLUMNS: Record<GroupByField, string> = {
 
 /** Rollup bucket width, and therefore the width of a partial-minute section. */
 const MINUTE_MS = 60_000;
+const SECOND_MS = 1_000;
+
+/**
+ * The two pre-aggregated sources, coarse first.
+ *
+ * A range's whole minutes come from `log_rollup_1m`; the partial minute at each
+ * end is decomposed into `log_rollup_1s` rows. Both are maintained inside the
+ * same transaction as the COPY that writes the raw rows, so both are exactly
+ * consistent with `logs` at every commit.
+ */
+type RollupTable = "log_rollup_1m" | "log_rollup_1s";
 
 export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
   const where = buildWhereClause(params.filters);
@@ -113,7 +124,10 @@ export function buildAggregateQuery(params: AggregateParams): AggregateQuery {
  * them out of this function — if that guard is ever loosened, this query will
  * silently ignore them.
  */
-export function buildRollupAggregateQuery(params: AggregateParams): AggregateQuery {
+export function buildRollupAggregateQuery(
+  params: AggregateParams,
+  secondRollupFrom: number = Number.POSITIVE_INFINITY,
+): AggregateQuery {
   const values: unknown[] = [];
 
   const param = (value: unknown): string => {
@@ -126,11 +140,11 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
     params.groupBy !== undefined ? GROUP_COLUMNS[params.groupBy] : "NULL";
 
   /**
-   * `service` and `level` restrictions, which both sources carry verbatim.
+   * `service` and `level` restrictions, which every source carries verbatim.
    *
-   * The rollup keeps both columns, so the same predicate is valid against
-   * either table — and the probes below must carry it too, or they would look
-   * for rows the query does not count.
+   * Both rollups keep both columns, so the same predicate is valid against any
+   * of the three tables — and the probes below must carry it too, or they would
+   * look for rows the query does not count.
    */
   const filterConditions = (): string[] => {
     const conditions: string[] = [];
@@ -145,8 +159,20 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
     return conditions;
   };
 
-  /** Rollup rows for whole minutes in `[from, to)`. */
-  const rollupSpan = (from: number, to: number): string => {
+  /**
+   * Every source reports a minute-granular bucket.
+   *
+   * The bucket expressions above are written against a minute column, so a
+   * source reading per-second rows has to round before the union rather than
+   * after it — otherwise a `1m` request would group by second.
+   */
+  const minuteBucketOf: Record<RollupTable, string> = {
+    log_rollup_1m: "bucket",
+    log_rollup_1s: "date_trunc('minute', bucket)",
+  };
+
+  /** Rollup rows for whole buckets in `[from, to)`. */
+  const rollupSpan = (table: RollupTable, from: number, to: number): string => {
     const conditions = [
       `bucket >= ${param(new Date(from))}`,
       `bucket < ${param(new Date(to))}`,
@@ -154,99 +180,164 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
     ];
 
     return `
-      SELECT bucket, service, level, count
-      FROM log_rollup_1m
+      SELECT ${minuteBucketOf[table]} AS bucket, service, level, count
+      FROM ${table}
+      WHERE ${conditions.join(" AND ")}
+    `;
+  };
+
+  /** Raw rows in `[from, to)`, counted one at a time, under a one-time guard. */
+  const rawSpan = (from: number, to: number, guard: string): string => {
+    const conditions = [
+      `"timestamp" >= ${param(new Date(from))}`,
+      `"timestamp" < ${param(new Date(to))}`,
+      ...filterConditions(),
+      guard,
+    ];
+
+    return `
+      SELECT date_trunc('minute', "timestamp") AS bucket,
+             service, level, 1::bigint AS count
+      FROM logs
       WHERE ${conditions.join(" AND ")}
     `;
   };
 
   /**
-   * Sources for `[from, to)`, a range lying inside the single minute that
-   * starts at `minuteStart`.
+   * "At least one row lies in a part of the bucket the request excludes."
+   *
+   * Written as `min(...) IS NOT NULL` rather than `EXISTS (...)`, and the
+   * difference is 394 ms.
+   *
+   * `EXISTS` tells the planner it may stop at the first matching row, and the
+   * planner concludes a sequential scan will reach one almost immediately — so
+   * it picks the sequential scan. But the answer this probe wants is usually
+   * *no*, and proving a range empty by sequential scan means reading the whole
+   * partition: measured at 78,231 buffers to clear one minute. `ORDER BY ...
+   * LIMIT 1` does not help, because ordering is meaningless to `EXISTS` and the
+   * planner discards it.
+   *
+   * `min()` over an indexed column is rewritten into "walk the index forward,
+   * take the first row" — a plan with no sequential-scan form to fall back to.
+   * Same answer, and the empty case costs an index descent: 0.17 ms, or 0.05 ms
+   * when a `service` filter lets it use the service index instead.
+   */
+  const gapProbe = (gaps: ReadonlyArray<readonly [number, number]>): string =>
+    gaps
+      .map(([gapFrom, gapTo]) => {
+        const conditions = [
+          `"timestamp" >= ${param(new Date(gapFrom))}`,
+          `"timestamp" < ${param(new Date(gapTo))}`,
+          ...filterConditions(),
+        ];
+
+        return `(SELECT min("timestamp") FROM logs WHERE ${conditions.join(" AND ")}) IS NOT NULL`;
+      })
+      .join(" OR ");
+
+  /**
+   * Sources for `[from, to)`, a range lying inside one bucket of `table`.
    *
    * Emits both branches — the rollup row and the raw scan — under complementary
    * one-time conditions, so exactly one of them produces rows. The condition is
-   * "the minute holds a row outside `[from, to)`": if it does not, the rollup
-   * row for that minute *is* the answer for `[from, to)`.
+   * "the bucket holds a row outside `[from, to)`": if it does not, the rollup
+   * row for that bucket *is* the answer for `[from, to)`.
    */
-  const partialMinuteSources = (
-    minuteStart: number,
+  const partialBucket = (
+    table: RollupTable,
+    grainMs: number,
+    bucketStart: number,
     from: number,
     to: number,
   ): string[] => {
-    const minuteEnd = minuteStart + MINUTE_MS;
+    const bucketEnd = bucketStart + grainMs;
 
-    // The parts of the minute the request does not ask for. Each is at most a
-    // minute wide, and each is probed rather than scanned.
+    // The parts of the bucket the request does not ask for. Each is at most one
+    // bucket wide, and each is probed rather than scanned.
     const gaps: Array<readonly [number, number]> = [];
-    if (from > minuteStart) {
-      gaps.push([minuteStart, from]);
+    if (from > bucketStart) {
+      gaps.push([bucketStart, from]);
     }
-    if (to < minuteEnd) {
-      gaps.push([to, minuteEnd]);
+    if (to < bucketEnd) {
+      gaps.push([to, bucketEnd]);
     }
-
-    const outsideRow = (): string =>
-      gaps
-        .map(([gapFrom, gapTo]) => {
-          const conditions = [
-            `"timestamp" >= ${param(new Date(gapFrom))}`,
-            `"timestamp" < ${param(new Date(gapTo))}`,
-            ...filterConditions(),
-          ];
-
-          // Written as `min(...) IS NOT NULL` rather than `EXISTS (...)`, and
-          // the difference is 394 ms.
-          //
-          // `EXISTS` tells the planner it may stop at the first matching row,
-          // and the planner concludes a sequential scan will reach one almost
-          // immediately — so it picks the sequential scan. But the answer this
-          // probe wants is usually *no*, and proving a range empty by
-          // sequential scan means reading the whole partition: measured at
-          // 78,231 buffers to clear one minute. `ORDER BY ... LIMIT 1` does not
-          // help, because ordering is meaningless to `EXISTS` and the planner
-          // discards it.
-          //
-          // `min()` over an indexed column is rewritten into "walk the index
-          // forward, take the first row" — a plan that has no sequential-scan
-          // form to fall back to. Same answer, and the empty case costs an index
-          // descent: 0.17 ms, or 0.05 ms when a `service` filter lets it use the
-          // service index instead.
-          return `(SELECT min("timestamp") FROM logs WHERE ${conditions.join(" AND ")}) IS NOT NULL`;
-        })
-        .join(" OR ");
 
     if (gaps.length === 0) {
-      // The request covers the whole minute after all.
-      return [rollupSpan(minuteStart, minuteEnd)];
+      // The request covers the whole bucket after all.
+      return [rollupSpan(table, bucketStart, bucketEnd)];
     }
 
     const rollupConditions = [
-      `bucket = ${param(new Date(minuteStart))}`,
+      `bucket = ${param(new Date(bucketStart))}`,
       ...filterConditions(),
-      `NOT (${outsideRow()})`,
-    ];
-
-    const rawConditions = [
-      `"timestamp" >= ${param(new Date(from))}`,
-      `"timestamp" < ${param(new Date(to))}`,
-      ...filterConditions(),
-      `(${outsideRow()})`,
+      `NOT (${gapProbe(gaps)})`,
     ];
 
     return [
       `
-      SELECT bucket, service, level, count
-      FROM log_rollup_1m
+      SELECT ${minuteBucketOf[table]} AS bucket, service, level, count
+      FROM ${table}
       WHERE ${rollupConditions.join(" AND ")}
     `,
-      `
-      SELECT date_trunc('minute', "timestamp") AS bucket,
-             service, level, 1::bigint AS count
-      FROM logs
-      WHERE ${rawConditions.join(" AND ")}
-    `,
+      rawSpan(from, to, `(${gapProbe(gaps)})`),
     ];
+  };
+
+  /**
+   * Sources for `[from, to)`, a range lying inside a single minute.
+   *
+   * Where the second rollup reaches, the minute is decomposed into whole
+   * seconds plus at most one partial second at each end — so the raw fallback,
+   * when a probe does fail, covers under a second of ingestion rather than up
+   * to a full minute. That is the leading edge of every range a client computes
+   * as `Date.now() - N`: the minute holding `since` nearly always has rows
+   * before it, so its probe fails by construction. Older minutes predate the
+   * second rollup and are answered from the minute rollup exactly as before.
+   */
+  const partialMinute = (minuteStart: number, from: number, to: number): string[] => {
+    if (minuteStart < secondRollupFrom) {
+      return partialBucket("log_rollup_1m", MINUTE_MS, minuteStart, from, to);
+    }
+
+    const firstWholeSecond = Math.ceil(from / SECOND_MS) * SECOND_MS;
+    const lastWholeSecond = Math.floor(to / SECOND_MS) * SECOND_MS;
+
+    if (lastWholeSecond <= firstWholeSecond) {
+      // The range does not span a whole second, so it is one partial second.
+      const secondStart = Math.floor(from / SECOND_MS) * SECOND_MS;
+
+      return partialBucket("log_rollup_1s", SECOND_MS, secondStart, from, to);
+    }
+
+    const sources: string[] = [];
+
+    if (from < firstWholeSecond) {
+      sources.push(
+        ...partialBucket(
+          "log_rollup_1s",
+          SECOND_MS,
+          firstWholeSecond - SECOND_MS,
+          from,
+          firstWholeSecond,
+        ),
+      );
+    }
+
+    sources.push(rollupSpan("log_rollup_1s", firstWholeSecond, lastWholeSecond));
+
+    if (to > lastWholeSecond) {
+      sources.push(
+        ...partialBucket(
+          "log_rollup_1s",
+          SECOND_MS,
+          lastWholeSecond,
+          lastWholeSecond,
+          to,
+        ),
+      );
+    }
+
+    return sources;
   };
 
   const sinceMs = params.since.getTime();
@@ -259,22 +350,20 @@ export function buildRollupAggregateQuery(params: AggregateParams): AggregateQue
   if (firstMinute === lastMinute) {
     // The whole range lies inside one minute, so there is one partial section
     // rather than a leading and a trailing one.
-    sources.push(...partialMinuteSources(firstMinute, sinceMs, untilMs));
+    sources.push(...partialMinute(firstMinute, sinceMs, untilMs));
   } else {
     if (sinceMs > firstMinute) {
-      sources.push(
-        ...partialMinuteSources(firstMinute, sinceMs, firstMinute + MINUTE_MS),
-      );
+      sources.push(...partialMinute(firstMinute, sinceMs, firstMinute + MINUTE_MS));
     }
 
     const wholeFrom = sinceMs > firstMinute ? firstMinute + MINUTE_MS : firstMinute;
 
     if (lastMinute > wholeFrom) {
-      sources.push(rollupSpan(wholeFrom, lastMinute));
+      sources.push(rollupSpan("log_rollup_1m", wholeFrom, lastMinute));
     }
 
     if (untilMs > lastMinute) {
-      sources.push(...partialMinuteSources(lastMinute, lastMinute, untilMs));
+      sources.push(...partialMinute(lastMinute, lastMinute, untilMs));
     }
   }
 

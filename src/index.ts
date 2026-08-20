@@ -5,6 +5,7 @@ import { startPartitionScheduler } from "./db/partitionScheduler.ts";
 import { closePools, createPools, verifyConnection } from "./db/pool.ts";
 import { enforceRetention, startRetentionScheduler } from "./db/retention.ts";
 import { rebuildRollup, startRollupScheduler } from "./db/rollup.ts";
+import { loadSecondRollupWindow } from "./db/rollupWindow.ts";
 import { markReady } from "./http/readiness.ts";
 import { buildServer } from "./http/server.ts";
 import { registerShutdownHandlers } from "./http/shutdown.ts";
@@ -79,6 +80,13 @@ try {
   // rather than from a full scan. On an empty database this is instant.
   const rollupBuckets = await rebuildRollup(pools.write);
   app.log.info({ buckets: rollupBuckets }, "Rollup rebuilt at startup");
+
+  // The aggregate path reads this to decide how far back the second rollup can
+  // answer a partial minute. Until it is loaded the process assumes "not at
+  // all", so loading it before ready means the first aggregate already takes
+  // the fast path.
+  const secondRollupFrom = await loadSecondRollupWindow(pools.write);
+  app.log.info({ secondRollupFrom }, "Second rollup window loaded");
 
   // Runs once at startup so a service that was down for a week does not wait
   // six hours before cleaning up. Retention covers the rollup as well as the

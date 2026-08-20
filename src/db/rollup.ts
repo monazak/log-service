@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
+import { pruneSecondRollup, SECOND_ROLLUP_RETENTION_MINUTES } from "./rollupWindow.ts";
 
 /**
  * Rollup maintenance.
@@ -133,6 +134,14 @@ export function startRollupScheduler(
     if (batcher.queueDepth() > 0) {
       return;
     }
+
+    // Trim the second rollup and republish its watermark. This runs on every
+    // tick, including past the backoff below: it is a delete against a table
+    // holding minutes of data, not a scan of `logs`, and the aggregate path
+    // needs the watermark current whether or not drift is still being checked.
+    pruneSecondRollup(pool, SECOND_ROLLUP_RETENTION_MINUTES).catch((error: unknown) => {
+      app.log.error(error, "Second rollup prune failed");
+    });
 
     // Nothing left to verify. The write path maintains the rollup itself, and
     // repeated clean checks proved nothing is arriving another way.

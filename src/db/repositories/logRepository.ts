@@ -12,6 +12,7 @@ import {
   buildRollupAggregateQuery,
 } from "../queries/aggregateQuery.ts";
 import { buildWhereClause } from "../queries/whereClause.ts";
+import { secondRollupFrom } from "../rollupWindow.ts";
 
 /**
  * Persistence for log entries.
@@ -87,32 +88,40 @@ function copyRow(entry: ValidLogEntry): string {
   return `${entry.timestamp.toISOString()}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(JSON.stringify(entry.attributes))}\n`;
 }
 
-/** Floors a timestamp to its minute, matching the rollup's bucket granularity. */
-function minuteBucket(timestamp: Date): number {
-  return Math.floor(timestamp.getTime() / 60_000) * 60_000;
+/** Floors a timestamp to a bucket width, in epoch milliseconds. */
+function floorTo(timestamp: Date, widthMs: number): number {
+  return Math.floor(timestamp.getTime() / widthMs) * widthMs;
 }
+
+const SECOND_MS = 1_000;
+const MINUTE_MS = 60_000;
 
 interface RollupDelta {
   readonly bucket: Date;
   readonly service: string;
   readonly level: string;
-  readonly count: number;
+  count: number;
 }
 
 /**
- * Counts a batch by (minute, service, level).
+ * Counts a batch by (second, service, level).
  *
  * A batch of several thousand entries collapses to at most
- * (minutes x services x levels) rows — typically around twenty. That is the
- * whole point: the rollup update becomes proportional to the batch's
- * *cardinality* rather than its size, and independent of how much data is
- * already stored.
+ * (seconds x services x levels) rows, and a flush spans well under a second, so
+ * in practice that is around twenty. That is the whole point: the rollup update
+ * becomes proportional to the batch's *cardinality* rather than its size, and
+ * independent of how much data is already stored.
+ *
+ * Seconds rather than minutes because the aggregate query reads this grain for
+ * the partial minute at each end of a range — see migration 021. Minute
+ * counters are folded out of these rather than accumulated separately, since
+ * folding twenty rows is cheaper than walking five thousand entries twice.
  */
-function computeRollupDeltas(entries: readonly ValidLogEntry[]): RollupDelta[] {
-  const counts = new Map<string, RollupDelta & { count: number }>();
+function computeSecondDeltas(entries: readonly ValidLogEntry[]): RollupDelta[] {
+  const counts = new Map<string, RollupDelta>();
 
   for (const entry of entries) {
-    const bucketMs = minuteBucket(entry.timestamp);
+    const bucketMs = floorTo(entry.timestamp, SECOND_MS);
     const key = `${bucketMs}\u0000${entry.service}\u0000${entry.level}`;
 
     const existing = counts.get(key);
@@ -132,51 +141,89 @@ function computeRollupDeltas(entries: readonly ValidLogEntry[]): RollupDelta[] {
   return [...counts.values()];
 }
 
+/** Folds per-second counters into per-minute counters. */
+function foldToMinutes(seconds: readonly RollupDelta[]): RollupDelta[] {
+  const counts = new Map<string, RollupDelta>();
+
+  for (const delta of seconds) {
+    const bucketMs = floorTo(delta.bucket, MINUTE_MS);
+    const key = `${bucketMs}\u0000${delta.service}\u0000${delta.level}`;
+
+    const existing = counts.get(key);
+
+    if (existing === undefined) {
+      counts.set(key, {
+        bucket: new Date(bucketMs),
+        service: delta.service,
+        level: delta.level,
+        count: delta.count,
+      });
+    } else {
+      existing.count += delta.count;
+    }
+  }
+
+  return [...counts.values()];
+}
+
 /**
- * Applies a batch's counters to the rollup.
+ * Applies a batch's counters to one rollup table.
  *
  * `ON CONFLICT ... DO UPDATE SET count = count + EXCLUDED.count` is what makes
- * this incremental: concurrent batches touching the same minute serialise on
+ * this incremental: concurrent batches touching the same bucket serialise on
  * the row and add rather than overwrite.
  *
- * Ordered by the primary key before insertion. Two concurrent batches updating
- * the same rows in different orders would deadlock; a consistent order makes
- * one wait instead.
+ * `ORDER BY` inside the statement is what keeps them from deadlocking instead.
+ * Two transactions that lock the same rows in opposite orders deadlock, and
+ * sorting in JavaScript is not enough to prevent it: `localeCompare` does not
+ * order strings the way the database's collation does, so two batches could
+ * still disagree. Ordering in SQL hands the decision to Postgres, which applies
+ * one collation to both.
+ *
+ * The table name is a literal chosen by the caller from the two below, never a
+ * value derived from a request.
  */
 async function applyRollupDeltas(
   client: pg.PoolClient,
+  table: "log_rollup_1s" | "log_rollup_1m",
   deltas: readonly RollupDelta[],
 ): Promise<void> {
   if (deltas.length === 0) {
     return;
   }
 
-  const ordered = [...deltas].sort((a, b) => {
-    const byBucket = a.bucket.getTime() - b.bucket.getTime();
-    if (byBucket !== 0) {
-      return byBucket;
-    }
-    const byService = a.service.localeCompare(b.service);
-    return byService !== 0 ? byService : a.level.localeCompare(b.level);
-  });
-
   const values: unknown[] = [];
   const rows: string[] = [];
 
-  for (const delta of ordered) {
+  for (const delta of deltas) {
     const base = values.length;
-    rows.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
+    rows.push(
+      `($${base + 1}::timestamptz, $${base + 2}::text, $${base + 3}::text, $${base + 4}::bigint)`,
+    );
     values.push(delta.bucket, delta.service, delta.level, delta.count);
   }
 
   await client.query(
     `
-      INSERT INTO log_rollup_1m (bucket, service, level, count)
-      VALUES ${rows.join(", ")}
+      INSERT INTO ${table} (bucket, service, level, count)
+      SELECT bucket, service, level, count
+      FROM (VALUES ${rows.join(", ")}) AS batch (bucket, service, level, count)
+      ORDER BY bucket, service, level
       ON CONFLICT (bucket, service, level)
-      DO UPDATE SET count = log_rollup_1m.count + EXCLUDED.count
+      DO UPDATE SET count = ${table}.count + EXCLUDED.count
     `,
     values,
+  );
+}
+
+/** Postgres reports a deadlock victim with SQLSTATE 40P01. */
+const DEADLOCK = "40P01";
+
+function isDeadlock(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === DEADLOCK
   );
 }
 
@@ -203,14 +250,10 @@ async function applyRollupDeltas(
  * one row at a time, which profiling showed spends most of its time in socket
  * writes.
  */
-export async function copyLogs(
+async function copyLogsOnce(
   pool: pg.Pool,
   entries: readonly ValidLogEntry[],
 ): Promise<number> {
-  if (entries.length === 0) {
-    return 0;
-  }
-
   const client = await pool.connect();
 
   try {
@@ -243,7 +286,12 @@ export async function copyLogs(
 
     await pipeline(source, stream);
 
-    await applyRollupDeltas(client, computeRollupDeltas(entries));
+    // Second counters first, then the minutes folded out of them. Both tables
+    // are always written in this order, so two concurrent flushes queue behind
+    // each other rather than each holding what the other needs next.
+    const secondDeltas = computeSecondDeltas(entries);
+    await applyRollupDeltas(client, "log_rollup_1s", secondDeltas);
+    await applyRollupDeltas(client, "log_rollup_1m", foldToMinutes(secondDeltas));
 
     await client.query("COMMIT");
     client.release();
@@ -255,6 +303,44 @@ export async function copyLogs(
     // implicit in destroying the connection.
     client.release(error as Error);
     throw error;
+  }
+}
+
+/**
+ * Writes a batch, retrying if the rollup upsert is chosen as a deadlock victim.
+ *
+ * Ordering the upserts makes a deadlock unlikely, not impossible: Postgres also
+ * takes speculative locks on keys that do not exist yet, and two batches
+ * inserting the same new bucket can still cross. A deadlock is by definition
+ * transient — the other transaction has already been allowed to finish — so the
+ * work is simply redone.
+ *
+ * Retrying is safe because nothing was committed. The COPY and both upserts
+ * share one transaction, so the victim's rows are gone from `logs` and from
+ * both rollups before the retry starts, and no entry can be counted twice.
+ *
+ * The caller is still waiting on this promise, so a retry costs latency on one
+ * batch rather than a rejected write. Two attempts is enough for contention
+ * this narrow; past that, the error is real and the batch is failed honestly.
+ */
+const MAX_WRITE_ATTEMPTS = 3;
+
+export async function copyLogs(
+  pool: pg.Pool,
+  entries: readonly ValidLogEntry[],
+): Promise<number> {
+  if (entries.length === 0) {
+    return 0;
+  }
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await copyLogsOnce(pool, entries);
+    } catch (error) {
+      if (attempt >= MAX_WRITE_ATTEMPTS || !isDeadlock(error)) {
+        throw error;
+      }
+    }
   }
 }
 
@@ -353,7 +439,7 @@ export async function aggregateLogs(
   params: AggregateParams,
 ): Promise<AggregateRow[]> {
   const query = canUseRollup(params)
-    ? buildRollupAggregateQuery(params)
+    ? buildRollupAggregateQuery(params, secondRollupFrom())
     : buildAggregateQuery(params);
 
   const result = await pool.query<AggregateRow>(query.sql, query.values);
