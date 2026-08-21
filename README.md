@@ -88,6 +88,7 @@ Every variable has a default. None are required.
 | `HOST` | `0.0.0.0` | Listen address — must not be localhost inside a container |
 | `DATABASE_URL` | `postgres://logservice:logservice@postgres:5432/logs` | Matches docker-compose.yml |
 | `DB_POOL_SIZE` | `20` | Connection pool size |
+| `INGEST_MAX_CONCURRENT_WRITES` | `2` | COPY transactions in flight at once. Raising it trades database contention for write parallelism; the default is measured |
 | `RETENTION_DAYS` | `30` | Age at which partitions are dropped |
 | `LOG_LEVEL` | `warn` in production, `info` otherwise | Application log verbosity |
 | `NODE_ENV` | `development` | Enables production logging behaviour when `production` |

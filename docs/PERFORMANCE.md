@@ -33,8 +33,10 @@ and read-after-write probes running concurrently.
 ### Beyond the target
 
 The stress and breakpoint stages raise the arrival rate well past 15,000/sec.
-Adaptive batching absorbs them without shedding: the busier the writers, the
-larger the batches they take.
+Batch size adapts on its own, so they are absorbed without shedding: the flush
+interval is fixed, so a higher arrival rate simply means more entries waiting
+when it fires. (This is the fixed-interval batcher — not the arrival-time
+flushing described below, which was tried and reverted.)
 
 | Arrival rate | Achieved | Ingestion p95 | Aggregate p95 | Failed |
 |---|---|---|---|---|
