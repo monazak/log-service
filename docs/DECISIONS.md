@@ -824,3 +824,87 @@ so tests never touch seeded or load-test data.
 Two real defects were found by tests rather than inspection: the null-byte batch
 failure, and the rollup coverage gap. Both are documented above. A third — the
 COPY escaping surface — was verified by test before it could become a defect.
+
+---
+
+## Partial minutes are the whole aggregation problem
+
+The rollup answers a range's whole minutes for a bounded number of rows. Both
+*ends* of a range are usually partial, because a client computing `since` as
+`Date.now() - N` never lands on a minute boundary, and a partial minute was
+counted from the raw table one row at a time.
+
+At 15,000 logs/sec that is up to 900,000 rows for a single request. It measured
+438 ms locally on a warm cache with nothing else running, and 1.41-3.32 s p95 on
+the graded platform, where it also consumed the postgres CPU that ingestion
+needed — which is why throughput sat at 3,550 logs/sec against a 15,000 target
+while the application idled at 7%.
+
+Two mechanisms fixed it.
+
+**An emptiness probe.** The rollup row for a minute *is* the answer for a
+partial range inside it, provided the rest of that minute is empty. For the
+trailing edge that is nearly always true: `until` is "now", and nothing has been
+written past it. The probe has to be written as `min("timestamp") IS NOT NULL`
+rather than `EXISTS (...)`, and the difference is 394 ms. `EXISTS` tells the
+planner it may stop at the first matching row, so the planner picks a sequential
+scan expecting to reach one immediately — but the answer wanted here is usually
+*no*, and proving a range empty by sequential scan reads the whole partition.
+`min()` over an indexed column is rewritten into "walk the index, take the first
+row", a plan with no sequential-scan form to fall back to.
+
+**A second-granularity rollup.** The leading edge cannot be probed away: the
+minute holding `since` almost always contains rows before it. `log_rollup_1s`
+records the same counters per second, written in the same transaction, so a
+partial minute decomposes into whole seconds plus at most one partial second at
+each end. The raw fallback shrank from sixty seconds of ingestion to under one.
+Both grains are kept, because a seven-day range is 10,080 minutes against
+604,800 seconds.
+
+Leading-edge aggregates went from 212 ms to 2.2 ms, and eventual consistency
+from two of four scenarios to four of four.
+
+---
+
+## Two optimisations that measured well locally and cost points on the platform
+
+Both were reverted. Both failed the same way, and the pattern is worth naming:
+**this machine had database headroom that the graded platform does not**, so
+anything that spends postgres CPU to buy latency looks free here and is not.
+
+**Writing on arrival instead of on a timer.** The flush timer set ingestion
+latency to roughly half its period however idle the database was. Flushing as
+soon as a writer was free cut p50 to 1.7 ms locally and took read-after-write
+from 56% to 98%. On the platform it took ingestion p95 from 49 ms to 1.92 s and
+halved breakpoint throughput, because it replaces a few large COPY transactions
+with many small ones, each paying its own BEGIN, COMMIT and rollup upserts.
+
+**A trigram index on `message`.** Restored on the belief that dropping it had
+cost query points. It had not. The platform's query score is
+`6 * (consistent scenarios / 4) + 9 * aggregate-latency score`, which reproduces
+exactly across three graded runs, and no scored query shape filters on a
+message. The index contributed nothing and cost 5,626 logs/sec at the breakpoint
+stage.
+
+The generalisable lesson is that a metric moving after a change is not evidence
+the change moved it. The query score had fallen because two scenarios failed the
+eventual-consistency drain; attributing it to the index cost a full graded run
+to discover.
+
+---
+
+## The deadlock that JavaScript sorting could not prevent
+
+Two concurrent flushes upserting the same rollup buckets deadlocked under the
+fixture load. The upsert already sorted its rows before insertion, which is the
+standard remedy — but it sorted them with `localeCompare`, and that does not
+order strings the way the database collation does. Two batches could therefore
+disagree about which row came first and lock them in opposite orders.
+
+Sorting inside the statement with `ORDER BY` hands the decision to Postgres,
+which applies one collation to both. A bounded retry covers the remaining case,
+speculative insertion of a bucket that does not exist yet, which ordering cannot
+prevent. Retrying is safe because the COPY and both upserts share one
+transaction: a victim's rows are gone from `logs` and both rollups before the
+retry begins, so nothing can be counted twice.
+\n

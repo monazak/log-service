@@ -53,14 +53,20 @@ export async function createHarness(): Promise<Harness> {
     pool: pools.write,
 
     async cleanup() {
-      // Rollup rows are cleaned first: they reference minutes that the log
+      // Rollup rows are cleaned first: they reference buckets that the log
       // deletion below is about to empty, and a stale rollup row would make the
       // next test's aggregate totals wrong.
-      await pools.write.query(
-        `DELETE FROM log_rollup_1m
-         WHERE service LIKE $1`,
-        [`${TEST_SERVICE_PREFIX}%`],
-      );
+      //
+      // Both grains, not just the minute one. The aggregate query reads
+      // `log_rollup_1s` for the partial minute at each end of a range, so a
+      // second-grain row left behind here is counted by the next test even
+      // though the raw rows it summarises are gone.
+      for (const table of ["log_rollup_1s", "log_rollup_1m"] as const) {
+        await pools.write.query(
+          `DELETE FROM ${table} WHERE service LIKE $1`,
+          [`${TEST_SERVICE_PREFIX}%`],
+        );
+      }
 
       await pools.write.query("DELETE FROM logs WHERE service LIKE $1", [
         `${TEST_SERVICE_PREFIX}%`,

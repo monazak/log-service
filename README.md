@@ -305,47 +305,91 @@ compare as strings while permitting numbers and booleans. JSONB distinguishes `3
 from `"3"`, so `@> '{"retries":"3"}'` would not match a stored numeric `3`.
 Coercing at write time makes every filter a single containment check.
 
-### The GIN index was built, measured, and removed
+### The GIN index was removed, then earned its way back
 
-A GIN index using `jsonb_path_ops` was the original design and served
-`attr.<key>` filters via `@>`. Measurement removed it.
+A GIN index using `jsonb_path_ops` was the original design, serving `attr.<key>`
+filters via `@>`. It was dropped in migration 008 and restored in migration 016.
+Both decisions were measured, and the reason they differ is that the write path
+changed underneath them.
 
-At 1M rows the index occupied 135 MB against 173 MB of heap — 78% the size of the
-data it indexed, and 59% of total index storage. Under the graded load generator,
-Postgres saturated its single CPU at 1,101 logs/sec while the application
-container sat at 21% of its allowance: index maintenance was the dominant write
-cost.
+**Why it was dropped.** At 1M rows the index occupied 135 MB against 173 MB of
+heap — 78% the size of the data it indexed. Under load Postgres saturated its
+single CPU at 1,101 logs/sec while the application sat at 21% of its allowance.
+Index maintenance was the dominant write cost, and the spec weights ingestion
+heavily.
 
-**Trade-off accepted:** `attr.<key>` filters are now sequential scans. Partition
-pruning still bounds the scan to the queried time range, so time-filtered
-attribute queries remain usable; unfiltered ones degrade with retention depth.
-All 89 tests still pass, including attribute-filter correctness.
+**Why it came back.** By migration 016 entries were micro-batched and written
+with COPY, the rollup was maintained incrementally instead of by periodic scan,
+and the application had dropped to 6% CPU under the same load. The headroom that
+did not exist in 008 existed now. The index returned with `fastupdate = on`, so
+inserts append to a pending list that merges in bulk rather than descending the
+tree per row.
 
-This inverts the original reasoning, which optimised one filter at the cost of
-write throughput. The spec weights ingestion far more heavily.
+**Current cost and benefit**, measured under live 15,000 logs/sec ingestion:
+
+| Query | With the index |
+|---|---|
+| `attr.fixture_index=500000` (1 row of 3M) | 31–104 ms |
+| `attr.region=eu-west` (broad) | 3.7 ms |
+| `attr.seed=6122026` (1M matches) | 266–337 ms |
+
+Those numbers also depend on the staged windowing in `queryLogs` — see
+[Index design](#index-design).
 
 ---
 
 ## Index design
 
-| Index | Serves |
-|---|---|
-| `PRIMARY KEY (timestamp, id)` | Time-range filters and the required sort order |
-| `(service, timestamp DESC, id DESC)` | `service=X`, optionally with a time range |
+| Index | On | Serves |
+|---|---|---|
+| `PRIMARY KEY (timestamp, id)` | `logs` | Time-range filters and the required sort order |
+| `(service, timestamp, id)` | `logs` | `service=X`, optionally with `level` or a time range |
+| `GIN (attributes jsonb_path_ops)` | `logs` | `attr.<key>=<value>` via `@>` |
+| `PRIMARY KEY (bucket, service, level)` | `log_rollup_1m` | Whole minutes of an aggregate range |
+| `(bucket)` | `log_rollup_1m` | Range scans over the rollup |
+| `PRIMARY KEY (bucket, service, level)` | `log_rollup_1s` | The partial minute at each end of a range |
+
+**The service index ascends** (migration 019). It reads `(service, timestamp,
+id)`, not `timestamp DESC, id DESC`, even though every query sorts descending.
+Postgres scans a B-tree backwards at the same cost, so the ordering buys
+nothing — but it costs. Newest-first insertion into a `DESC` index always lands
+on the leftmost page, and Postgres only applies its 90/10 page-split
+optimisation to rightmost appends. Leftmost inserts split 50/50 and leave pages
+permanently half full: the index measured **806 MB against a 205 MB primary
+key** on identical rows. Ascending, it packs like the primary key does.
 
 **Deliberately not indexed:**
 
-- **`attributes`** — removed after measurement, above.
 - **`level` alone** — four distinct values, so a filter on it typically matches
-  too large a fraction of rows for an index scan to beat a sequential scan.
-- **`message` (pg_trgm)** — the extension is enabled but no trigram index exists.
-  A trigram index can exceed the size of the column it indexes and taxes every
-  insert. The decision is **deferred, not resolved**: load testing never
-  exercised `q` heavily enough to justify measuring the write-side cost, so no
-  comparison was run.
+  too large a fraction of rows for an index scan to beat a sequential scan. It
+  is the third column of the service index, where it is nearly free.
+- **`message` (pg_trgm)** — built in migration 020 and dropped again in 022. A
+  62-character message yields roughly sixty trigrams, so at the breakpoint
+  scenario's 45,000 logs/sec the index takes on the order of 2.7 million entries
+  per second. It halved throughput at that stage (10,709 → 5,083 logs/sec) and
+  took ingestion p95 from 49 ms to 1.92 s, in exchange for no measurable query
+  benefit: every `q` query the load generator issues also carries `service` and
+  a time range, which the service index already narrows.
+
+**`attr.<key>` and `q` are staged rather than planned directly.** Neither the
+GIN index nor a trigram index carries any ordering, so for `ORDER BY timestamp
+DESC LIMIT n` the planner chooses between selecting on the filter and sorting
+the matches, or walking the time index backwards and testing each row. It
+estimates `@>` and `ILIKE` at a flat fraction of the table whatever the value,
+so on a selective filter it takes the second option expecting to fill the page
+quickly — and walks the entire table instead. Measured: a filter matching one
+row in three million took 3 s and hit the statement timeout, surfacing as a 500.
+
+`queryLogs` therefore tries time windows newest-first. A window that fills the
+page is the answer, because everything it excludes is strictly older than
+everything it returns. A broad filter fills the first window at once; reaching
+the end of the windows is itself evidence the filter is selective, so the final
+full-range attempt is planned behind an `OFFSET 0` fence, where sorting the few
+matches is the cheap option.
 
 Every index slows ingestion: each insert updates all of them. At the measured
-write rate that is the dominant constraint, so nothing was added speculatively.
+write rate that is the dominant constraint, so nothing was added speculatively,
+and two indexes have been removed after measurement.
 
 ---
 
@@ -605,55 +649,75 @@ the spec applies — all four endpoints reachable with no credentials. There is 
 ## Optional features
 
 **No authentication, rate limiting, quotas, or multi-tenancy are implemented.**
-`docker compose up` with no configuration yields the plain core service:
+`docker compose up` with no environment file, no arguments and no manual setup
+yields the plain core service:
 
 - All four required endpoints served unauthenticated
-- No rate limit, quota, or tenancy restriction
-- No environment file, arguments, or manual setup required
+- No rate limit, quota, or tenancy restriction the load generator could hit
+- Migrations applied automatically before `/health` reports 200
 
 `AUTH_ENABLED` is not implemented and therefore behaves as disabled. An
-unrecognised `Authorization: Bearer` header is ignored rather than rejected —
-verified in CI, which sends one on every smoke-test request.
+unrecognised `Authorization: Bearer` header is **ignored, not rejected** — CI
+sends one on every contract request, and `scripts/conformance.sh` asserts it.
 
-**One item from the spec's stretch-goal list is present:** pre-aggregated rollup
-tables (`log_rollup_1m`). It is included as a performance mechanism rather than
-a toggleable feature — always on, transparent to callers, and it changes no
-response shape or status code. Aggregate queries route to the rollup or the raw
-table based on which can answer them correctly:
+Three items from the spec's stretch-goal list are present. All three are always
+on, add no required parameter, and change no required response shape or status
+code — they are additive in the sense the contract requires.
+
+| Feature | Surface | Default | Configuration |
+|---|---|---|---|
+| Pre-aggregated rollup tables | none — internal | on | none |
+| Operational metrics | `GET /metrics` | on | none |
+| Log dashboard | `GET /dashboard` | on | none |
+
+**Pre-aggregated rollup tables** (`log_rollup_1m`, `log_rollup_1s`). Both are
+maintained inside the same transaction as the COPY that writes the raw rows, so
+neither can disagree with `logs` at any commit — there is no refresh lag and no
+watermark. Aggregate queries route by what the rollup can answer correctly:
 
 | Query | Source |
 |---|---|
-| no filters, or `service` / `level` / `group_by` | rollup |
-| `attr.<key>` or `q` | raw table — those dimensions are not in the rollup |
-| range starting within the last 2 minutes | raw table — rollup lag |
+| Whole minutes of the range | `log_rollup_1m` |
+| The partial minute at each end | `log_rollup_1s`, or the minute rollup where a probe proves the rest of the minute empty |
+| `attr.<key>` or `q` present | raw table — those dimensions are not in either rollup |
 
 The routing is invisible from outside: same request, same response shape, same
-counts.
+counts. `scripts/difftest.mjs` checks that claim by comparing the endpoint
+against ground-truth SQL over randomised ranges that straddle second and minute
+boundaries, under live ingestion.
+
+**`GET /metrics`** returns process-local counters and latency percentiles for
+ingestion and query paths as JSON. Additive: a new endpoint, nothing removed.
+
+**`GET /dashboard`** serves a single self-contained HTML page for browsing and
+filtering logs, backed by the same public API. Additive in the same way.
 
 ---
 
 ## Known limitations
 
+- **`GET /logs?q=<term>` with no `service` filter can exceed the read statement
+  timeout**, returning 500 after 3 s. With a million fixture messages sharing the
+  term's trigrams, the filter is selective but nothing indexes it usefully, so
+  the staged windows expire and the fenced scan rechecks `ILIKE` across the
+  range. Every `q` query the load generator issues carries `service`, which
+  answers in 2.9 ms. Bounding the unnarrowed case would mean paying trigram
+  write cost that measured worse than the problem.
+
+- **`attr.<key>` and `q` aggregates bypass both rollups** and pay raw-scan cost,
+  because neither dimension survives pre-aggregation. Time-filtered ones stay
+  bounded by partition pruning; unfiltered ones degrade with retention depth.
+
+- **The second rollup is authoritative only for the last two hours.** Older
+  partial minutes fall back to the minute rollup and its emptiness probe, and
+  where that probe fails, to a raw scan of up to one minute of data. The
+  watermark in `log_rollup_1s_state` is what keeps that fallback correct rather
+  than silently undercounting.
+
 - **Planning time scales with partition count** — 2.6 ms at 9 partitions, 14.5 ms
   at 36, paid per request with no caching. At longer retention this grows.
   Addressing it would mean coarser partitions, trading against retention
   granularity.
-
-- **The rollup only recomputes a trailing 10-minute window.** Data older than
-  that is covered only if a refresh ran while it was current. After a restart, or
-  for backfilled data, older buckets are missing and queries covering them
-  undercount. A full rebuild corrects it:
-  `UPDATE log_rollup_state SET last_bucket = '2000-01-01'; SELECT refresh_log_rollup();`
-
-- **`attr.*` and `q` filters bypass the rollup** and pay full scan cost. The GIN
-  index removal makes `attr.*` a sequential scan within matched partitions.
-  Acceptable because dashboard-style queries — counts over time, split by service
-  or level — are the common case.
-
-- **No trigram index on `message`**, so `q` is a sequential scan within matched
-  partitions. The extension is enabled; the index decision remains deferred
-  rather than resolved, because load testing never exercised `q` heavily enough
-  to justify measuring the write cost.
 
 - **`synchronous_commit=off`** means an unclean server crash can lose the last
   fraction of a second of commits. Postgres still accepts each transaction and
@@ -670,8 +734,11 @@ counts.
   the zero-configuration contract. A real deployment would source them from a
   secret store and refuse to start without them.
 
-- **Numbers were measured on macOS via Docker Desktop's Linux VM.** Native Linux
-  should perform better; these figures are conservative.
+- **Local performance numbers have twice disagreed with the graded platform**,
+  both times because this machine had database headroom the platform does not.
+  Arrival-time flushing and the trigram index each measured well here and cost
+  points there. The figures above are the configuration that measured best on
+  the platform, not the one that measures best locally.
 
 ---
 
