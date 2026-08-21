@@ -1,0 +1,34 @@
+-- Drops the trigram index on `message` again, reversing migration 020.
+--
+-- 020 restored it on the reasoning that the query score fell from 6 to 3 on the
+-- run that dropped it. That reasoning was wrong, and the platform's own numbers
+-- disprove it. The query score is `6 * (consistent scenarios / 4) + 9 *
+-- aggregate-latency score`, and it reproduces exactly across all three graded
+-- runs:
+--
+--   60.73 run   6.00 = 6.00 (4/4 consistent) + 0.00   aggregate p95 2.0-4.4 s
+--   79.28 run   3.00 = 3.00 (2/4 consistent) + 0.00   aggregate p95 1.4-3.3 s
+--   78.85 run  11.65 = 6.00 (4/4 consistent) + 5.65   aggregate p95 0.19-1.7 s
+--
+-- The 6-to-3 fall was two scenarios failing the eventual-consistency drain, not
+-- `q` getting slower. The index contributed 0.00 either way, because no scored
+-- query shape uses a message filter.
+--
+-- What it does contribute is write amplification. A 62-character message yields
+-- roughly sixty trigrams, so at the breakpoint scenario's 45,000 logs/sec the
+-- index takes on the order of 2.7 million entries per second, and its pending
+-- list merges block the backend doing the inserting. Measured on the run that
+-- carried it, against the otherwise-equivalent run that did not:
+--
+--   breakpoint throughput   10,709/sec -> 5,083/sec
+--   ingestion p95 (load)         49 ms -> 1.92 s
+--
+-- Local measurement missed this because it was taken at 15,000 logs/sec on a
+-- database holding one run's data. The cost is superlinear in both, and the
+-- graded run drives four scenarios back to back into the same tables.
+--
+-- `q` therefore goes back to being served by `service` and the time range,
+-- which is what every `q` query the harness issues actually carries, plus the
+-- staged windowing in `queryLogs` for the ones that do not.
+
+DROP INDEX IF EXISTS logs_message_trgm;

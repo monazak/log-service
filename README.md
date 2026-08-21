@@ -3,12 +3,12 @@
 A service that ingests high volumes of structured logs, stores them in
 PostgreSQL, and exposes query and time-bucketed aggregation APIs.
 
-Measured against the graded harness's own fixtures at **15,026 logs/sec** — its
-full 15,000/sec target — with aggregation at **6.9 ms p95 under concurrent
-ingestion** and **97.5% read-after-write visibility**, inside the specified
-container limits (app 0.5 CPU / 256 MB, postgres 1 CPU / 1 GB). It absorbs the
-harness's 45,000/sec breaking-point stage at 44,802 logs/sec without dropping a
-request.
+Measured against the graded harness's own fixtures at **15,014 logs/sec** — its
+full 15,000/sec target — with aggregation at **6.4 ms p95 under concurrent
+ingestion**, inside the specified container limits (app 0.5 CPU / 256 MB,
+postgres 1 CPU / 1 GB), and postgres still at 27% of its single CPU. It absorbs
+the harness's 45,000/sec breaking-point stage at 44,929 logs/sec without
+dropping a request.
 
 ---
 
