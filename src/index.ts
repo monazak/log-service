@@ -12,7 +12,7 @@ import { registerShutdownHandlers } from "./http/shutdown.ts";
 
 const config = loadConfig();
 const pools = createPools(config);
-const batcher = new LogBatcher(pools.write);
+const batcher = new LogBatcher(pools.write, config.maxConcurrentWrites);
 const app = buildServer(config, pools, batcher);
 
 let partitionTimer: NodeJS.Timeout | undefined;

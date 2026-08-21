@@ -6,6 +6,7 @@ export interface Config {
   readonly databaseUrl: string;
   readonly dbPoolSize: number;
   readonly retentionDays: number;
+  readonly maxConcurrentWrites: number;
 }
 
 function readPort(raw: string | undefined, fallback: number): number {
@@ -44,5 +45,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env["DATABASE_URL"] ?? "postgres://logservice:logservice@postgres:5432/logs",
     dbPoolSize: readPositiveInt(env["DB_POOL_SIZE"], 8, "DB_POOL_SIZE"),
     retentionDays: readPositiveInt(env["RETENTION_DAYS"], 30, "RETENTION_DAYS"),
+
+    // How many COPY transactions may be in flight at once. The default is
+    // measured, not arbitrary — see LogBatcher. Exposed because the right value
+    // depends on how much CPU the database has relative to the arrival rate,
+    // which is a property of the deployment rather than of the code.
+    maxConcurrentWrites: readPositiveInt(
+      env["INGEST_MAX_CONCURRENT_WRITES"],
+      2,
+      "INGEST_MAX_CONCURRENT_WRITES",
+    ),
   };
 }

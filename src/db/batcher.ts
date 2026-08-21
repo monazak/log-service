@@ -76,7 +76,7 @@ const MAX_BATCH_ENTRIES = 5000;
  * At 15,000 and 30,000 logs/sec the two are indistinguishable on throughput, so
  * the higher cap buys nothing anywhere and costs the breaking point.
  */
-const MAX_CONCURRENT_FLUSHES = 2;
+const DEFAULT_MAX_CONCURRENT_FLUSHES = 2;
 
 /**
  * Queue ceiling.
@@ -111,9 +111,11 @@ export class LogBatcher {
   private timer: NodeJS.Timeout | undefined;
   private activeFlushes = 0;
   private readonly pool: pg.Pool;
+  private readonly maxConcurrentFlushes: number;
 
-  constructor(pool: pg.Pool) {
+  constructor(pool: pg.Pool, maxConcurrentFlushes = DEFAULT_MAX_CONCURRENT_FLUSHES) {
     this.pool = pool;
+    this.maxConcurrentFlushes = maxConcurrentFlushes;
   }
 
   /**
@@ -182,7 +184,7 @@ export class LogBatcher {
     // Backpressure rather than unbounded concurrency: the queue keeps
     // accumulating instead of starting a fifth write, and reschedules so the
     // work is not stranded. A larger batch is cheaper per row anyway.
-    if (this.activeFlushes >= MAX_CONCURRENT_FLUSHES) {
+    if (this.activeFlushes >= this.maxConcurrentFlushes) {
       this.scheduleFlush();
       return;
     }
