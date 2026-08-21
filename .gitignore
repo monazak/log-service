@@ -20,5 +20,10 @@ npm-debug.log*
 
 # Editors
 .vscode/
-.idea/benchmark-report.json
+.idea/
+
+# Benchmark output
 benchmark-report.json
+
+# Personal demo prep, not part of the submission
+video-script.md
