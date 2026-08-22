@@ -44,7 +44,13 @@ services:
       POSTGRES_PASSWORD: logservice
       POSTGRES_DB: logs
     ports:
-      - "5432:5432"
+      # 55432 on the host, not 5432. A developer machine very often already runs
+      # a native postgres on 5432, and docker's wildcard bind loses to it: the
+      # container starts, the mapping looks correct, and psql silently reaches
+      # the wrong server. The grader resets this mapping away entirely and the
+      # application connects over the compose network, so the host-side port is
+      # only ever a convenience for tooling on this machine.
+      - "55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     shm_size: 256mb
